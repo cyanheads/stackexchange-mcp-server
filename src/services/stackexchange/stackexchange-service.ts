@@ -169,7 +169,7 @@ export class StackExchangeService {
   }
 
   /** Fetch, decompress (auto), parse, handle errors. */
-  private async fetchSe<T>(url: string, ctx: Context, callerName: string): Promise<SeWrapper<T>> {
+  private async fetchSe<T>(url: string, ctx: Context): Promise<SeWrapper<T>> {
     await waitForBackoff();
 
     const response = await fetch(url, {
@@ -197,21 +197,16 @@ export class StackExchangeService {
           error_id: errObj.error_id,
         });
       }
-      throw serviceUnavailable(
-        `Stack Exchange API returned HTTP ${response.status} in ${callerName}`,
-        { status: response.status, body: text.slice(0, 500) },
-      );
+      throw serviceUnavailable(`Stack Exchange API returned HTTP ${response.status}`, {
+        status: response.status,
+      });
     }
 
     let wrapper: SeWrapper<T>;
     try {
       wrapper = JSON.parse(text) as SeWrapper<T>;
     } catch (err) {
-      throw serviceUnavailable(
-        `Failed to parse Stack Exchange response in ${callerName}`,
-        { callerName },
-        { cause: err },
-      );
+      throw serviceUnavailable('Failed to parse Stack Exchange response', {}, { cause: err });
     }
 
     updateBackoff(wrapper);
@@ -253,7 +248,7 @@ export class StackExchangeService {
         }
 
         const url = this.buildUrl('/search/advanced', params);
-        const wrapper = await this.fetchSe<SeQuestion>(url, ctx, 'searchQuestions');
+        const wrapper = await this.fetchSe<SeQuestion>(url, ctx);
 
         if (wrapper.quota_remaining === 0) {
           throw rateLimited('Stack Exchange API quota exhausted.', {
@@ -308,8 +303,8 @@ export class StackExchangeService {
         });
 
         const [questionWrapper, answersWrapper] = await Promise.all([
-          this.fetchSe<SeQuestion>(questionUrl, ctx, 'getThread:question'),
-          this.fetchSe<SeAnswer>(answersUrl, ctx, 'getThread:answers'),
+          this.fetchSe<SeQuestion>(questionUrl, ctx),
+          this.fetchSe<SeAnswer>(answersUrl, ctx),
         ]);
 
         if (questionWrapper.quota_remaining === 0) {
@@ -391,7 +386,7 @@ export class StackExchangeService {
           site: opts.site,
           pagesize: opts.pageSize ?? 10,
         });
-        const wrapper = await this.fetchSe<SeQuestion>(url, ctx, 'getTagFaq');
+        const wrapper = await this.fetchSe<SeQuestion>(url, ctx);
 
         if (wrapper.quota_remaining === 0) {
           throw rateLimited('Stack Exchange API quota exhausted.', {
@@ -440,8 +435,8 @@ export class StackExchangeService {
         });
 
         const [profileWrapper, topTagsWrapper] = await Promise.all([
-          this.fetchSe<SeUser>(profileUrl, ctx, 'getUser:profile'),
-          this.fetchSe<SeTopTag>(topTagsUrl, ctx, 'getUser:top-tags'),
+          this.fetchSe<SeUser>(profileUrl, ctx),
+          this.fetchSe<SeTopTag>(topTagsUrl, ctx),
         ]);
 
         if (profileWrapper.quota_remaining === 0) {
@@ -504,7 +499,7 @@ export class StackExchangeService {
     return withRetry(
       async () => {
         const url = this.buildUrl('/sites', { pagesize: 100 });
-        const wrapper = await this.fetchSe<SeSite>(url, ctx, 'getSites');
+        const wrapper = await this.fetchSe<SeSite>(url, ctx);
 
         // SE API returns site names and audiences HTML-encoded (e.g. "Unix &amp; Linux")
         const normalizeSite = (s: SeSite): NormalizedSite => ({
@@ -519,7 +514,7 @@ export class StackExchangeService {
         // If there are more pages, fetch them (SE has ~190 sites, fits in 2 pages at pagesize=100)
         if (wrapper.has_more) {
           const page2Url = this.buildUrl('/sites', { pagesize: 100, page: 2 });
-          const wrapper2 = await this.fetchSe<SeSite>(page2Url, ctx, 'getSites:page2');
+          const wrapper2 = await this.fetchSe<SeSite>(page2Url, ctx);
           sites.push(...wrapper2.items.map(normalizeSite));
         }
 
