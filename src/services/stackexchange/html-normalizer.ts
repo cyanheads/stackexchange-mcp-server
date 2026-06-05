@@ -14,8 +14,13 @@ export function normalizeHtml(html: string): string {
 
   let md = html;
 
-  // Decode common HTML entities before processing
-  md = decodeEntities(md);
+  // NOTE: do NOT call decodeEntities() here. HTML entities must remain encoded
+  // until after all HTML tags are processed. Pre-decoding &lt;/&gt; converts
+  // them to < / > which (a) breaks stripTags() on attribute values containing >
+  // (e.g. alt="x >= 128" gets split mid-tag) and (b) makes entity-encoded
+  // angle brackets in code blocks look like real HTML tags that then get stripped.
+  // Entities are decoded inside code block handlers explicitly, and by the final
+  // decodeEntities() call at the end of this function.
 
   // Fenced code blocks: <pre><code>...</code></pre> → ```\n...\n```
   // SE wraps code blocks in both tags; capture the language hint from class if present.
@@ -132,10 +137,24 @@ export function normalizeHtml(html: string): string {
   // Line breaks
   md = md.replace(/<br\s*\/?>/gi, '\n');
 
-  // Strip any remaining tags
+  // Strip any remaining HTML tags (img, hr, sub, sup, table, etc.).
+  // Protect already-converted fenced code blocks first — their decoded content
+  // (e.g. `#include <algorithm>`) contains angle brackets that would otherwise
+  // be misidentified as HTML tags and stripped.
+  const codeBlocks: string[] = [];
+  const PLACEHOLDER_PREFIX = 'MDCODEBLOCK';
+  const PLACEHOLDER_SUFFIX = 'ENDMDCODEBLOCK';
+  md = md.replace(/```[\s\S]*?```/g, (block) => {
+    codeBlocks.push(block);
+    return `${PLACEHOLDER_PREFIX}${codeBlocks.length - 1}${PLACEHOLDER_SUFFIX}`;
+  });
   md = stripTags(md);
+  md = md.replace(
+    new RegExp(`${PLACEHOLDER_PREFIX}(\\d+)${PLACEHOLDER_SUFFIX}`, 'g'),
+    (_, idx: string) => codeBlocks[parseInt(idx, 10)] ?? '',
+  );
 
-  // Re-decode entities that may have been introduced
+  // Decode entities in the non-code portions (remaining &amp;, &lt;, etc.)
   md = decodeEntities(md);
 
   // Normalize excessive blank lines (max 2 consecutive newlines)
@@ -147,6 +166,15 @@ export function normalizeHtml(html: string): string {
 /** Strip all HTML tags from a string. */
 function stripTags(html: string): string {
   return html.replace(/<[^>]+>/g, '');
+}
+
+/**
+ * Decode basic HTML entities in a plain-text string (not HTML).
+ * Use this for SE API fields like site names and audiences that arrive
+ * HTML-encoded but contain no markup.
+ */
+export function decodeHtmlEntities(text: string): string {
+  return decodeEntities(text);
 }
 
 /** Decode basic HTML entities. */

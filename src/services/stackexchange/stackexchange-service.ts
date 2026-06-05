@@ -15,7 +15,7 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { normalizeHtml } from './html-normalizer.js';
+import { decodeHtmlEntities, normalizeHtml } from './html-normalizer.js';
 import type {
   SeAnswer,
   SeError,
@@ -506,25 +506,21 @@ export class StackExchangeService {
         const url = this.buildUrl('/sites', { pagesize: 100 });
         const wrapper = await this.fetchSe<SeSite>(url, ctx, 'getSites');
 
-        const sites: NormalizedSite[] = wrapper.items.map((s) => ({
-          name: s.name,
+        // SE API returns site names and audiences HTML-encoded (e.g. "Unix &amp; Linux")
+        const normalizeSite = (s: SeSite): NormalizedSite => ({
+          name: decodeHtmlEntities(s.name),
           apiSiteParameter: s.api_site_parameter,
           siteUrl: s.site_url,
-          ...(s.audience ? { audience: s.audience } : {}),
-        }));
+          ...(s.audience ? { audience: decodeHtmlEntities(s.audience) } : {}),
+        });
+
+        const sites: NormalizedSite[] = wrapper.items.map(normalizeSite);
 
         // If there are more pages, fetch them (SE has ~190 sites, fits in 2 pages at pagesize=100)
         if (wrapper.has_more) {
           const page2Url = this.buildUrl('/sites', { pagesize: 100, page: 2 });
           const wrapper2 = await this.fetchSe<SeSite>(page2Url, ctx, 'getSites:page2');
-          sites.push(
-            ...wrapper2.items.map((s) => ({
-              name: s.name,
-              apiSiteParameter: s.api_site_parameter,
-              siteUrl: s.site_url,
-              ...(s.audience ? { audience: s.audience } : {}),
-            })),
-          );
+          sites.push(...wrapper2.items.map(normalizeSite));
         }
 
         return { sites, quotaRemaining: wrapper.quota_remaining, quotaMax: wrapper.quota_max };

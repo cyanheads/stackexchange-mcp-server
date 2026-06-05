@@ -27,16 +27,24 @@ describe('normalizeHtml', () => {
     });
 
     it('decodes HTML entities inside code blocks', () => {
-      // The normalizer runs decodeEntities first, so &lt; → <, &gt; → > before
-      // the pre/code regex runs. Then stripTags removes the resulting < > as tags.
-      // The final entity re-decode pass catches any remaining &amp;→& etc.
-      // The key behavior: code content is preserved (not dropped) and the outer
-      // fenced-block structure is correct.
-      const html = '<pre><code>x = 1;\ny = 2;</code></pre>';
+      // Entities inside <pre><code> (e.g. &lt;, &gt;) must survive as literal
+      // characters in the fenced code block output. The normalizer defers
+      // entity decoding until after HTML tags are processed, so &lt;algorithm&gt;
+      // in a code block becomes <algorithm> in the markdown output — not stripped.
+      const html = '<pre><code>#include &lt;algorithm&gt;\nx = 1;</code></pre>';
       const result = normalizeHtml(html);
       expect(result).toMatch(/^```\n/);
+      expect(result).toContain('#include <algorithm>');
       expect(result).toContain('x = 1;');
-      expect(result).toContain('y = 2;');
+    });
+
+    it('preserves < > literals in code blocks with SE lang-* class', () => {
+      // SE uses lang-* (not language-*) for its prettyprint classes; the second
+      // regex (no language hint) handles these. Entities must still decode.
+      const html =
+        '<pre class="lang-cpp prettyprint-override"><code>if (x &lt; 0) return;</code></pre>';
+      const result = normalizeHtml(html);
+      expect(result).toBe('```\nif (x < 0) return;\n```');
     });
 
     it('wraps code in triple backtick fences (not inline backtick)', () => {
@@ -159,13 +167,12 @@ describe('normalizeHtml', () => {
       expect(result).toContain("it's fine");
     });
 
-    it('note: bare &lt;/&gt; in text content are stripped by the tag-removal pass', () => {
-      // The normalizer first decodes &lt;→< then stripTags removes anything
-      // that looks like a tag opener. This is expected behavior for SE content
-      // where raw < in text is delivered pre-escaped.
-      // Verify the function does not crash and returns something.
-      const result = normalizeHtml('a &lt; b');
-      expect(typeof result).toBe('string');
+    it('decodes &lt; and &gt; in plain text (not code)', () => {
+      // In non-code text, &lt; and &gt; should decode to < and > in the output.
+      // stripTags runs before decodeEntities, so &lt; stays as &lt; during
+      // the tag-strip pass and only becomes < at the final decode step.
+      expect(normalizeHtml('a &lt; b')).toBe('a < b');
+      expect(normalizeHtml('a &gt; b')).toBe('a > b');
     });
 
     it('decodes &nbsp; to space', () => {
