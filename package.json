@@ -1,7 +1,7 @@
 {
   "name": "stackexchange-mcp-server",
   "version": "0.1.0",
-  "description": "",
+  "description": "MCP server for Stack Exchange network — Stack Overflow, Super User, Server Fault, and 180+ communities. Search questions, fetch complete Q&A threads as clean markdown, browse tag FAQs, and look up user profiles.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -42,7 +42,7 @@
   "keywords": ["mcp", "mcp-server", "model-context-protocol"],
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "https://github.com/cyanheads/stackexchange-mcp-server"
   },
   "license": "Apache-2.0",
   "engines": {

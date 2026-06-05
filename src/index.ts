@@ -5,17 +5,22 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
-import { echoPrompt } from './mcp-server/prompts/definitions/echo.prompt.js';
-import { echoResource } from './mcp-server/resources/definitions/echo.resource.js';
-import { echoAppUiResource } from './mcp-server/resources/definitions/echo-app-ui.app-resource.js';
-import { echoTool } from './mcp-server/tools/definitions/echo.tool.js';
-import { echoAppTool } from './mcp-server/tools/definitions/echo-app.app-tool.js';
+import { getServerConfig } from './config/server-config.js';
+import { allToolDefinitions } from './mcp-server/tools/definitions/index.js';
+import { initStackExchangeService } from './services/stackexchange/stackexchange-service.js';
 
 await createApp({
-  tools: [echoTool, echoAppTool],
-  resources: [echoResource, echoAppUiResource],
-  prompts: [echoPrompt],
-  // instructions: 'Server-level orientation forwarded to the model on every initialize.\n' +
-  //   '- Use shortcut `X` for the most common case\n' +
-  //   '- Tools require auth via the `inventory:read` scope',
+  tools: allToolDefinitions,
+  resources: [],
+  prompts: [],
+  instructions:
+    'Stack Exchange network access — Stack Overflow, Super User, Server Fault, Unix & Linux, and 180+ more sites.\n' +
+    'Workflow: use stackexchange_list_sites to find a site api_site_parameter, then stackexchange_search_questions ' +
+    'or stackexchange_get_tag_faq to discover question IDs, then stackexchange_get_thread for full Q&A content with ' +
+    'markdown-normalized bodies. stackexchange_get_user resolves an answer author by user_id.\n' +
+    'Rate limit: ~300 requests/day keyless per IP; set STACKEXCHANGE_API_KEY for ~10,000/day.',
+  setup(core) {
+    const serverConfig = getServerConfig();
+    initStackExchangeService(core.config, core.storage, serverConfig.apiKey);
+  },
 });
