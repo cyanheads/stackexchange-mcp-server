@@ -225,7 +225,7 @@ export class StackExchangeService {
   }
 
   /** Search questions (no bodies). */
-  async searchQuestions(
+  searchQuestions(
     opts: SearchQuestionsOptions,
     ctx: Context,
   ): Promise<{
@@ -243,13 +243,13 @@ export class StackExchangeService {
           intitle: undefined,
         };
         if (opts.tags && opts.tags.length > 0) {
-          params['tagged'] = opts.tags.join(';');
+          params.tagged = opts.tags.join(';');
         }
         if (opts.acceptedOnly) {
-          params['accepted'] = 'True';
+          params.accepted = 'True';
         }
         if (opts.minScore !== undefined) {
-          params['min'] = opts.minScore;
+          params.min = opts.minScore;
         }
 
         const url = this.buildUrl('/search/advanced', params);
@@ -286,7 +286,7 @@ export class StackExchangeService {
   }
 
   /** Fetch a complete Q&A thread with HTML→markdown normalization. */
-  async getThread(
+  getThread(
     opts: GetThreadOptions,
     ctx: Context,
   ): Promise<{
@@ -377,7 +377,7 @@ export class StackExchangeService {
   }
 
   /** Fetch the tag FAQ (highest-voted answered questions for a tag). */
-  async getTagFaq(
+  getTagFaq(
     opts: GetTagFaqOptions,
     ctx: Context,
   ): Promise<{
@@ -423,7 +423,7 @@ export class StackExchangeService {
   }
 
   /** Fetch a user profile + top tags. */
-  async getUser(
+  getUser(
     opts: GetUserOptions,
     ctx: Context,
   ): Promise<{
@@ -496,7 +496,7 @@ export class StackExchangeService {
   }
 
   /** Fetch all sites in the SE network (paginated, bounded set). */
-  async getSites(ctx: Context): Promise<{
+  getSites(ctx: Context): Promise<{
     sites: NormalizedSite[];
     quotaRemaining: number;
     quotaMax: number;

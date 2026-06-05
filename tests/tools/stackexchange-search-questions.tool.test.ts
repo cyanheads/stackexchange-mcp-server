@@ -95,7 +95,7 @@ describe('stackexchangeSearchQuestions handler', () => {
     await stackexchangeSearchQuestions.handler(input, ctx);
     // Empty tags should be filtered out — tags key should be absent or empty
     const callArg = mockSvc.searchQuestions.mock.calls[0]![0] as Record<string, unknown>;
-    const tags = callArg['tags'] as string[] | undefined;
+    const tags = callArg.tags as string[] | undefined;
     expect(!tags || tags.length === 0).toBe(true);
   });
 

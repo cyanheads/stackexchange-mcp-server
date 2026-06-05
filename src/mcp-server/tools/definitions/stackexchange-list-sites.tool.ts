@@ -67,7 +67,7 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
     ctx.enrich({ quotaRemaining, quotaMax });
 
     let filtered = sites;
-    if (input.filter && input.filter.trim()) {
+    if (input.filter?.trim()) {
       const normalize = (s: string) =>
         s
           .toLowerCase()
@@ -76,7 +76,7 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
           .replace(/[^a-z0-9\s]/g, ' ');
       const tokens = normalize(input.filter).split(/\s+/).filter(Boolean);
       filtered = sites.filter((s) => {
-        const hay = normalize(s.name) + ' ' + normalize(s.apiSiteParameter);
+        const hay = `${normalize(s.name)} ${normalize(s.apiSiteParameter)}`;
         return tokens.every((t) => hay.includes(t));
       });
 
