@@ -11,19 +11,6 @@
 
 ---
 
-## First Session
-
-This project was just scaffolded with `bunx @cyanheads/mcp-ts-core init`. You're holding a production-grade MCP framework with the hard parts already solved — error handling, telemetry, auth, transport, validation, lifecycle. What's missing is the **domain**. Your job: design the tool, resource, and service surface with the user, then implement it as small pure handlers that throw — the framework catches, classifies, and instruments the rest. Design before code; the user's first messages set direction, so wait for them before scaffolding definitions.
-
-> **Remove this section** from CLAUDE.md / AGENTS.md after completing these steps. The skills and conventions below remain — this block is one-time onboarding only.
-
-1. **Get your bearings.** Take stock of the project tree, the skills in `skills/`, and the tools/MCP servers available. Light tool use is fine for context-building — you're mapping the territory, not committing yet.
-2. **Read the framework docs** — `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` (builders, Context, errors, exports, conventions)
-3. **Run the `setup` skill** — read `skills/setup/SKILL.md` and follow its checklist (project orientation, agent protocol file selection, echo definition cleanup, skill sync)
-4. **Design the server** — read `skills/design-mcp-server/SKILL.md` and work through it with the user to map the domain into tools, resources, and services before scaffolding
-
----
-
 ## What's Next?
 
 When the user asks what's next or needs direction, suggest options based on the current project state. Common next steps:
@@ -60,71 +47,49 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const stackexchangeSearchQuestions = tool('stackexchange_search_questions', {
+  description: 'Search questions across a Stack Exchange site...',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().default(10).describe('Max results'),
+    query: z.string().describe('Full-text search query.'),
+    site: z.string().default('stackoverflow').describe('api_site_parameter value.'),
+    pageSize: z.number().int().min(1).max(30).default(10).describe('Number of results (1–30).'),
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    questions: z.array(z.object({
+      questionId: z.number().int().describe('Pass to stackexchange_get_thread for the full thread.'),
+      title: z.string().describe('Question title.'),
+      score: z.number().int().describe('Question score.'),
+    })).describe('Matching questions.'),
   }),
-  auth: ['inventory:read'],
-
-  async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+  enrichment: {
+    quotaRemaining: z.number().describe('Remaining API quota calls for the current day.'),
   },
-
-  // format() populates content[] — the markdown twin of structuredContent.
-  // Different clients read different surfaces (Claude Code → structuredContent,
-  // Claude Desktop → content[]); both must carry the same data.
-  // Enforced at lint time: every field in `output` must appear in the rendered text.
+  errors: [
+    {
+      reason: 'invalid_site',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'SE returns bad_parameter for an unknown site value.',
+      recovery: 'Call stackexchange_list_sites to discover valid site values and retry.',
+    },
+  ],
+  async handler(input, ctx) {
+    const svc = getStackExchangeService();
+    const { questions, quotaRemaining, quotaMax } = await svc.searchQuestions(
+      { query: input.query, site: input.site, pageSize: input.pageSize },
+      ctx,
+    );
+    ctx.enrich({ quotaRemaining, quotaMax });
+    ctx.log.info('Searched SE questions', { query: input.query, count: questions.length });
+    return { questions };
+  },
   format: (result) => [{
     type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
+    text: result.questions.map(q => `**${q.questionId}**: ${q.title} (score: ${q.score})`).join('\n'),
   }],
-});
-```
-
-### Resource
-
-```ts
-import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
-
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
-  async handler(params, ctx) {
-    const item = await ctx.state.get(`item:${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
-    return item;
-  },
-});
-```
-
-### Prompt
-
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
-  }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
-  ],
 });
 ```
 
@@ -136,21 +101,22 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
+  apiKey: z
+    .string()
+    .optional()
+    .describe('Stack Exchange API key — lifts quota from ~300/day to ~10,000/day.'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
 export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
+    apiKey: 'STACKEXCHANGE_API_KEY',
   });
   return _config;
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`MY_API_KEY`) not the path (`apiKey`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`STACKEXCHANGE_API_KEY`) not the path (`apiKey`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
 
 ### Server instructions
 
@@ -225,18 +191,20 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 src/
   index.ts                              # createApp() entry point
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                    # STACKEXCHANGE_API_KEY Zod schema
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    stackexchange/
+      stackexchange-service.ts          # SE API v2.3 HTTP client, backoff tracking, quota logging
+      html-normalizer.ts                # HTML→markdown converter for SE post bodies
+      types.ts                          # SE API response types
   mcp-server/
     tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
-    resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      stackexchange-search-questions.tool.ts
+      stackexchange-get-thread.tool.ts
+      stackexchange-get-tag-faq.tool.ts
+      stackexchange-get-user.tool.ts
+      stackexchange-list-sites.tool.ts
+      index.ts                          # barrel export
 ```
 
 ---
