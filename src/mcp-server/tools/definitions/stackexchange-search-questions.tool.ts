@@ -90,6 +90,11 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
           ),
       )
       .describe('Questions matching the search query, ordered by the specified sort.'),
+    attribution: z
+      .string()
+      .describe(
+        'Content license notice. Stack Exchange content is licensed under CC BY-SA 4.0 and requires attribution.',
+      ),
   }),
   enrichment: {
     quotaRemaining: z.number().describe('Remaining API quota calls for the current day.'),
@@ -149,7 +154,11 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       count: questions.length,
     });
 
-    return { questions };
+    return {
+      questions,
+      attribution:
+        'Stack Exchange Network — content licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)',
+    };
   },
 
   format: (result) => {
@@ -167,6 +176,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       if (q.excerpt) lines.push(`\n${q.excerpt}`);
       lines.push('');
     }
+    lines.push(`---\n*${result.attribution}*`);
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

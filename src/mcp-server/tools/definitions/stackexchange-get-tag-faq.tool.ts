@@ -65,6 +65,11 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       .describe('Highest-voted answered questions for the specified tag, ordered by votes.'),
     tag: z.string().describe('Tag name used for this FAQ lookup.'),
     site: z.string().describe('Stack Exchange site api_site_parameter used for this lookup.'),
+    attribution: z
+      .string()
+      .describe(
+        'Content license notice. Stack Exchange content is licensed under CC BY-SA 4.0 and requires attribution.',
+      ),
   }),
   enrichment: {
     quotaRemaining: z.number().describe('Remaining API quota calls for the current day.'),
@@ -119,13 +124,21 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       count: questions.length,
     });
 
-    return { questions, tag: input.tag, site: input.site };
+    return {
+      questions,
+      tag: input.tag,
+      site: input.site,
+      attribution:
+        'Stack Exchange Network — content licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)',
+    };
   },
 
   format: (result) => {
     const lines: string[] = [`## Tag FAQ: \`${result.tag}\` on ${result.site}\n`];
     if (result.questions.length === 0) {
       lines.push('No FAQ questions found for this tag.');
+      lines.push('');
+      lines.push(`---\n*${result.attribution}*`);
       return [{ type: 'text', text: lines.join('\n') }];
     }
     for (const q of result.questions) {
@@ -137,6 +150,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       lines.push(`**Link:** ${q.link}`);
       lines.push('');
     }
+    lines.push(`---\n*${result.attribution}*`);
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

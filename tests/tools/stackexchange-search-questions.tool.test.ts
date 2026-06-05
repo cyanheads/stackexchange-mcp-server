@@ -55,6 +55,7 @@ describe('stackexchangeSearchQuestions handler', () => {
     const result = await stackexchangeSearchQuestions.handler(input, ctx);
     expect(result.questions).toHaveLength(1);
     expect(result.questions[0]!.questionId).toBe(11227809);
+    expect(result.attribution).toContain('CC BY-SA');
   });
 
   it('applies default site=stackoverflow and sort=relevance', async () => {
@@ -148,15 +149,21 @@ describe('stackexchangeSearchQuestions handler', () => {
 // ---------------------------------------------------------------------------
 // format() tests
 // ---------------------------------------------------------------------------
+const ATTRIBUTION =
+  'Stack Exchange Network — content licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)';
+
 describe('stackexchangeSearchQuestions format', () => {
   it('renders "No questions found" for empty result', () => {
-    const blocks = stackexchangeSearchQuestions.format!({ questions: [] });
+    const blocks = stackexchangeSearchQuestions.format!({
+      questions: [],
+      attribution: ATTRIBUTION,
+    });
     expect(blocks[0]!.type).toBe('text');
     expect((blocks[0] as { text: string }).text).toContain('No questions found');
   });
 
   it('renders question ID and title in output', () => {
-    const output = { questions: [makeQuestion()] };
+    const output = { questions: [makeQuestion()], attribution: ATTRIBUTION };
     const blocks = stackexchangeSearchQuestions.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('11227809');
@@ -164,7 +171,7 @@ describe('stackexchangeSearchQuestions format', () => {
   });
 
   it('renders score, answer count, tags, and link', () => {
-    const output = { questions: [makeQuestion()] };
+    const output = { questions: [makeQuestion()], attribution: ATTRIBUTION };
     const blocks = stackexchangeSearchQuestions.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('28000');
@@ -173,9 +180,18 @@ describe('stackexchangeSearchQuestions format', () => {
     expect(text).toContain('https://stackoverflow.com/questions/11227809');
   });
 
+  it('renders CC BY-SA attribution footer', () => {
+    const output = { questions: [makeQuestion()], attribution: ATTRIBUTION };
+    const blocks = stackexchangeSearchQuestions.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('CC BY-SA');
+    expect(text).toContain('Stack Exchange Network');
+  });
+
   it('includes excerpt when present', () => {
     const output = {
       questions: [makeQuestion({ excerpt: 'Branch prediction makes the difference.' })],
+      attribution: ATTRIBUTION,
     };
     const blocks = stackexchangeSearchQuestions.format!(output);
     const text = (blocks[0] as { text: string }).text;
@@ -183,7 +199,7 @@ describe('stackexchangeSearchQuestions format', () => {
   });
 
   it('omits excerpt gracefully when absent (sparse upstream)', () => {
-    const output = { questions: [makeQuestion({ excerpt: undefined })] };
+    const output = { questions: [makeQuestion({ excerpt: undefined })], attribution: ATTRIBUTION };
     const blocks = stackexchangeSearchQuestions.format!(output);
     expect(blocks[0]!.type).toBe('text');
     // Should not crash or contain "undefined"

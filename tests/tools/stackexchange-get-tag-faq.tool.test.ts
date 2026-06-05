@@ -52,6 +52,7 @@ describe('stackexchangeGetTagFaq handler', () => {
     expect(result.questions).toHaveLength(1);
     expect(result.tag).toBe('java');
     expect(result.site).toBe('stackoverflow');
+    expect(result.attribution).toContain('CC BY-SA');
   });
 
   it('defaults site to stackoverflow and pageSize to 10', async () => {
@@ -107,12 +108,16 @@ describe('stackexchangeGetTagFaq handler', () => {
 // ---------------------------------------------------------------------------
 // format() tests
 // ---------------------------------------------------------------------------
+const ATTRIBUTION =
+  'Stack Exchange Network — content licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)';
+
 describe('stackexchangeGetTagFaq format', () => {
   it('renders tag and site header', () => {
     const output = {
       questions: [makeFaqQuestion()],
       tag: 'java',
       site: 'stackoverflow',
+      attribution: ATTRIBUTION,
     };
     const blocks = stackexchangeGetTagFaq.format!(output);
     const text = (blocks[0] as { text: string }).text;
@@ -125,6 +130,7 @@ describe('stackexchangeGetTagFaq format', () => {
       questions: [makeFaqQuestion()],
       tag: 'java',
       site: 'stackoverflow',
+      attribution: ATTRIBUTION,
     };
     const blocks = stackexchangeGetTagFaq.format!(output);
     const text = (blocks[0] as { text: string }).text;
@@ -134,11 +140,31 @@ describe('stackexchangeGetTagFaq format', () => {
     expect(text).toContain('https://stackoverflow.com/questions/11227809');
   });
 
+  it('renders CC BY-SA attribution footer', () => {
+    const output = {
+      questions: [makeFaqQuestion()],
+      tag: 'java',
+      site: 'stackoverflow',
+      attribution: ATTRIBUTION,
+    };
+    const blocks = stackexchangeGetTagFaq.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('CC BY-SA');
+    expect(text).toContain('Stack Exchange Network');
+  });
+
   it('renders "No FAQ questions found" for empty result', () => {
-    const output = { questions: [], tag: 'noop', site: 'stackoverflow' };
+    const output = { questions: [], tag: 'noop', site: 'stackoverflow', attribution: ATTRIBUTION };
     const blocks = stackexchangeGetTagFaq.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('No FAQ questions found');
+  });
+
+  it('renders attribution footer even for empty result', () => {
+    const output = { questions: [], tag: 'noop', site: 'stackoverflow', attribution: ATTRIBUTION };
+    const blocks = stackexchangeGetTagFaq.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('CC BY-SA');
   });
 
   it('does not include "undefined" in output for sparse questions', () => {
@@ -147,6 +173,7 @@ describe('stackexchangeGetTagFaq format', () => {
       questions: [makeFaqQuestion()],
       tag: 'java',
       site: 'stackoverflow',
+      attribution: ATTRIBUTION,
     };
     const blocks = stackexchangeGetTagFaq.format!(output);
     expect((blocks[0] as { text: string }).text).not.toContain('undefined');
