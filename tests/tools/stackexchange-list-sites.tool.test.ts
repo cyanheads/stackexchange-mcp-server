@@ -121,6 +121,16 @@ describe('stackexchangeListSites handler', () => {
     expect(result.totalCount).toBe(result.sites.length);
   });
 
+  it('calls ctx.enrich.notice when filter returns no results', async () => {
+    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    const ctx = createMockContext();
+    const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
+    const input = stackexchangeListSites.input.parse({ filter: 'xyzzy-does-not-exist' });
+    await stackexchangeListSites.handler(input, ctx);
+    expect(noticeSpy).toHaveBeenCalledOnce();
+    expect(noticeSpy.mock.calls[0]![0]).toContain('xyzzy-does-not-exist');
+  });
+
   it('handles sites with no audience field (sparse)', async () => {
     mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
     const ctx = createMockContext();

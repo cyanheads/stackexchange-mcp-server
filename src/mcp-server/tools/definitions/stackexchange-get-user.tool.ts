@@ -11,8 +11,8 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
   title: 'Get Stack Exchange User Profile',
   description:
     'Fetch a Stack Exchange user profile by numeric user ID: reputation, badge counts, top tags by answer score, ' +
-    'and account metadata. Useful for credibility context on an answer author — the owner.user_id from ' +
-    'stackexchange_get_thread output can be passed directly. Returns profile fields plus up to 10 top tags by answer score.',
+    'and account metadata. Useful for credibility context on an answer author — pass the authorUserId from any ' +
+    'question or answer in stackexchange_get_thread output. Returns profile fields plus up to 10 top tags by answer score.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -22,7 +22,9 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
     userId: z
       .number()
       .int()
-      .describe('Numeric user ID (e.g. from owner.user_id in stackexchange_get_thread output).'),
+      .describe(
+        'Numeric user ID — use the authorUserId field from a question or answer in stackexchange_get_thread output.',
+      ),
     site: z
       .string()
       .default('stackoverflow')

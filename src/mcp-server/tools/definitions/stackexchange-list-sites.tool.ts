@@ -54,6 +54,10 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
     quotaMax: z
       .number()
       .describe('Maximum API quota calls per day (300 keyless, ~10,000 with API key).'),
+    notice: z
+      .string()
+      .optional()
+      .describe('Actionable guidance when results are empty or filtered.'),
   },
   enrichmentTrailer: {
     quotaRemaining: { label: 'Quota Remaining' },

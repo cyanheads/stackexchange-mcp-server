@@ -83,6 +83,13 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     bodyMarkdown: z.string().describe('Question body normalized from HTML to markdown.'),
     authorName: z.string().optional().describe('Question author display name when available.'),
     authorLink: z.string().optional().describe('Question author profile URL when available.'),
+    authorUserId: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Question author numeric user ID when available — pass to stackexchange_get_user to fetch the full profile.',
+      ),
     acceptedAnswerId: z
       .number()
       .int()
@@ -106,6 +113,13 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
               .int()
               .optional()
               .describe('Answer author reputation when available.'),
+            authorUserId: z
+              .number()
+              .int()
+              .optional()
+              .describe(
+                'Answer author numeric user ID when available — pass to stackexchange_get_user to fetch the full profile.',
+              ),
           })
           .describe('A single Q&A answer with markdown body, score, and author attribution.'),
       )
@@ -196,7 +210,8 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       const authorRef = result.authorLink
         ? `[${result.authorName}](${result.authorLink})`
         : result.authorName;
-      lines.push(`**Author:** ${authorRef}`);
+      const userIdSuffix = result.authorUserId != null ? ` (user_id: ${result.authorUserId})` : '';
+      lines.push(`**Author:** ${authorRef}${userIdSuffix}`);
     }
     if (result.acceptedAnswerId != null) {
       lines.push(`**Accepted Answer ID:** ${result.acceptedAnswerId}`);
@@ -223,7 +238,8 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         const attrParts: string[] = [`**Score:** ${a.score}`];
         if (a.authorName) {
           const authorRef = a.authorLink ? `[${a.authorName}](${a.authorLink})` : a.authorName;
-          attrParts.push(`**Author:** ${authorRef}`);
+          const userIdSuffix = a.authorUserId != null ? ` (user_id: ${a.authorUserId})` : '';
+          attrParts.push(`**Author:** ${authorRef}${userIdSuffix}`);
           if (a.authorReputation != null) {
             attrParts.push(`rep: ${a.authorReputation.toLocaleString()}`);
           }

@@ -101,6 +101,7 @@ export interface NormalizedAnswer {
   authorLink?: string;
   authorName?: string;
   authorReputation?: number;
+  authorUserId?: number;
   bodyMarkdown: string;
   isAccepted: boolean;
   score: number;
@@ -112,6 +113,7 @@ export interface NormalizedThread {
   answers: NormalizedAnswer[];
   authorLink?: string;
   authorName?: string;
+  authorUserId?: number;
   bodyMarkdown: string;
   link: string;
   questionId: number;
@@ -191,8 +193,15 @@ export class StackExchangeService {
         // ignore parse failure
       }
       if (errObj?.error_name === 'bad_parameter') {
-        throw invalidParams(`Stack Exchange API error: ${errObj.error_message}`, {
-          reason: 'invalid_site',
+        // SE returns error_message "ids" when the IDs field is rejected (e.g. out-of-range integer).
+        // All other bad_parameter responses (site, tags, etc.) map to invalid_site.
+        const reason = errObj.error_message === 'ids' ? 'invalid_id_or_url' : 'invalid_site';
+        const message =
+          reason === 'invalid_id_or_url'
+            ? `The question ID is not a valid Stack Exchange question ID.`
+            : `Stack Exchange API error: ${errObj.error_message}`;
+        throw invalidParams(message, {
+          reason,
           error_name: errObj.error_name,
           error_id: errObj.error_id,
         });
@@ -260,13 +269,13 @@ export class StackExchangeService {
 
         const questions: NormalizedQuestion[] = wrapper.items.map((q) => ({
           questionId: q.question_id,
-          title: q.title,
+          title: decodeHtmlEntities(q.title),
           link: q.link,
           score: q.score,
           answerCount: q.answer_count,
           isAnswered: q.is_answered,
           tags: q.tags,
-          ...(q.excerpt ? { excerpt: q.excerpt } : {}),
+          ...(q.excerpt ? { excerpt: decodeHtmlEntities(q.excerpt) } : {}),
         }));
 
         return { questions, quotaRemaining: wrapper.quota_remaining, quotaMax: wrapper.quota_max };
@@ -341,17 +350,19 @@ export class StackExchangeService {
           ...(a.owner?.display_name ? { authorName: a.owner.display_name } : {}),
           ...(a.owner?.link ? { authorLink: a.owner.link } : {}),
           ...(a.owner?.reputation !== undefined ? { authorReputation: a.owner.reputation } : {}),
+          ...(a.owner?.user_id !== undefined ? { authorUserId: a.owner.user_id } : {}),
         }));
 
         const thread: NormalizedThread = {
           questionId: q.question_id,
-          title: q.title,
+          title: decodeHtmlEntities(q.title),
           link: q.link,
           score: q.score,
           tags: q.tags,
           bodyMarkdown: normalizeHtml(q.body ?? ''),
           ...(q.owner?.display_name ? { authorName: q.owner.display_name } : {}),
           ...(q.owner?.link ? { authorLink: q.owner.link } : {}),
+          ...(q.owner?.user_id !== undefined ? { authorUserId: q.owner.user_id } : {}),
           answers: normalizedAnswers,
           ...(q.accepted_answer_id !== undefined ? { acceptedAnswerId: q.accepted_answer_id } : {}),
         };
@@ -398,7 +409,7 @@ export class StackExchangeService {
 
         const questions: NormalizedQuestion[] = wrapper.items.map((q) => ({
           questionId: q.question_id,
-          title: q.title,
+          title: decodeHtmlEntities(q.title),
           link: q.link,
           score: q.score,
           answerCount: q.answer_count,

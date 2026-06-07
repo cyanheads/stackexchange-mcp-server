@@ -103,6 +103,22 @@ describe('stackexchangeGetThread handler', () => {
     });
   });
 
+  it('throws invalid_id_or_url when service rejects the ID as bad_parameter (out-of-range integer)', async () => {
+    const { invalidParams } = await import('@cyanheads/mcp-ts-core/errors');
+    mockGetService.mockReturnValue({
+      getThread: vi.fn().mockRejectedValue(
+        invalidParams('The question ID is not a valid Stack Exchange question ID.', {
+          reason: 'invalid_id_or_url',
+        }),
+      ),
+    } as ReturnType<typeof getStackExchangeService>);
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '99999999999' });
+    await expect(stackexchangeGetThread.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_id_or_url' },
+    });
+  });
+
   it('propagates question_not_found when service throws (empty items[])', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
     mockGetService.mockReturnValue({
@@ -155,6 +171,36 @@ describe('stackexchangeGetThread handler', () => {
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
     const result = await stackexchangeGetThread.handler(input, ctx);
     expect(result.answers).toHaveLength(0);
+  });
+
+  it('returns authorUserId on question and answer when present', async () => {
+    const threadWithIds = makeThread({
+      authorUserId: 1,
+      answers: [makeAnswer({ authorUserId: 22656 })],
+    });
+    mockGetService.mockReturnValue(
+      makeThreadResult(threadWithIds) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
+    const result = await stackexchangeGetThread.handler(input, ctx);
+    expect(result.authorUserId).toBe(1);
+    expect(result.answers[0]!.authorUserId).toBe(22656);
+  });
+
+  it('omits authorUserId gracefully when absent (community wiki, deleted user)', async () => {
+    const sparseThread = makeThread({
+      authorUserId: undefined,
+      answers: [makeAnswer({ authorUserId: undefined })],
+    });
+    mockGetService.mockReturnValue(
+      makeThreadResult(sparseThread) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
+    const result = await stackexchangeGetThread.handler(input, ctx);
+    expect(result.authorUserId).toBeUndefined();
+    expect(result.answers[0]!.authorUserId).toBeUndefined();
   });
 
   it('passes maxAnswers to service', async () => {

@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { normalizeHtml } from '@/services/stackexchange/html-normalizer.js';
+import { decodeHtmlEntities, normalizeHtml } from '@/services/stackexchange/html-normalizer.js';
 
 describe('normalizeHtml', () => {
   it('returns empty string for empty input', () => {
@@ -204,6 +204,22 @@ describe('normalizeHtml', () => {
       const html = '<div><span>Hello</span></div>';
       const result = normalizeHtml(html);
       expect(result).toBe('Hello');
+    });
+  });
+
+  describe('decodeHtmlEntities (plain-text fields like question titles)', () => {
+    it('decodes &#39; to apostrophe in question titles', () => {
+      expect(
+        decodeHtmlEntities('Why can&#39;t I store a value and a reference in the same struct?'),
+      ).toBe("Why can't I store a value and a reference in the same struct?");
+    });
+
+    it('decodes &amp; to & in multi-word tag names', () => {
+      expect(decodeHtmlEntities('Unix &amp; Linux')).toBe('Unix & Linux');
+    });
+
+    it('leaves already-decoded strings unchanged', () => {
+      expect(decodeHtmlEntities("Why can't I store a value?")).toBe("Why can't I store a value?");
     });
   });
 

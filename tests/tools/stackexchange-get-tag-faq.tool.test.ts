@@ -76,6 +76,16 @@ describe('stackexchangeGetTagFaq handler', () => {
     expect(result.tag).toBe('nonexistent-tag-xyz');
   });
 
+  it('calls ctx.enrich.notice when tag returns no results', async () => {
+    mockGetService.mockReturnValue(makeFaqResult([]) as ReturnType<typeof getStackExchangeService>);
+    const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
+    const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
+    const input = stackexchangeGetTagFaq.input.parse({ tag: 'nonexistent-tag-xyz' });
+    await stackexchangeGetTagFaq.handler(input, ctx);
+    expect(noticeSpy).toHaveBeenCalledOnce();
+    expect(noticeSpy.mock.calls[0]![0]).toContain('nonexistent-tag-xyz');
+  });
+
   it('propagates service errors (invalid_site → throws)', async () => {
     const { invalidParams } = await import('@cyanheads/mcp-ts-core/errors');
     mockGetService.mockReturnValue({
