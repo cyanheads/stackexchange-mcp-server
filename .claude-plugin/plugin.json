@@ -1,19 +1,20 @@
 {
   "name": "stackexchange-mcp-server",
-  "version": "0.1.1",
-  "description": "",
+  "version": "0.1.5",
+  "description": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
   "author": {
-    "name": ""
+    "name": "cyanheads"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/stackexchange-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/stackexchange-mcp-server",
   "license": "Apache-2.0",
   "mcpServers": {
     "stackexchange-mcp-server": {
       "command": "npx",
-      "args": ["-y", "stackexchange-mcp-server"],
+      "args": ["-y", "@cyanheads/stackexchange-mcp-server", "run", "start:stdio"],
       "env": {
-        "MCP_TRANSPORT_TYPE": "stdio"
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "STACKEXCHANGE_API_KEY": ""
       }
     }
   }

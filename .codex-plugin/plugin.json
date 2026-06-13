@@ -1,25 +1,25 @@
 {
   "name": "stackexchange-mcp-server",
-  "version": "0.1.1",
-  "description": "",
+  "version": "0.1.5",
+  "description": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
   "author": {
-    "name": "",
-    "email": "",
-    "url": ""
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/stackexchange-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/stackexchange-mcp-server",
   "license": "Apache-2.0",
   "keywords": ["mcp", "mcp-server", "model-context-protocol"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "stackexchange-mcp-server",
-    "shortDescription": "",
-    "longDescription": "",
-    "developerName": "",
-    "category": "",
+    "shortDescription": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
+    "longDescription": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
+    "developerName": "cyanheads",
+    "category": "developer-tools",
     "capabilities": ["Read"],
-    "websiteURL": "",
+    "websiteURL": "https://github.com/cyanheads/stackexchange-mcp-server#readme",
     "defaultPrompt": []
   }
 }

@@ -1,6 +1,6 @@
 # stackexchange-mcp-server - Directory Structure
 
-Generated on: 2026-06-05 10:08:27
+Generated on: 2026-06-13 04:45:24
 
 ```text
 stackexchange-mcp-server/
@@ -31,6 +31,7 @@ stackexchange-mcp-server/
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
@@ -116,6 +117,10 @@ stackexchange-mcp-server/
 │   ├── security-pass/
 │   │   └── SKILL.md
 │   ├── setup/
+│   │   └── SKILL.md
+│   ├── techniques/
+│   │   ├── references/
+│   │   │   └── outline-on-overflow.md
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md

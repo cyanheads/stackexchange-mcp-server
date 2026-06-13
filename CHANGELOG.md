@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-12
+
+Framework adoption (mcp-ts-core ^0.10.6); validationError reclassification for invalid_site/invalid_id_or_url; truncation enrichment on search/thread/FAQ; MCPB bundle cleaner and Docker healthcheck
+
 ## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-06-06
 
 HTML entity decoding in question titles, out-of-range ID error classification, authorUserId field alignment, and empty-result notices in structuredContent
