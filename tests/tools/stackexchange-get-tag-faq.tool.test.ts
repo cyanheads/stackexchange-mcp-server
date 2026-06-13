@@ -87,11 +87,11 @@ describe('stackexchangeGetTagFaq handler', () => {
   });
 
   it('propagates service errors (invalid_site → throws)', async () => {
-    const { invalidParams } = await import('@cyanheads/mcp-ts-core/errors');
+    const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
     mockGetService.mockReturnValue({
       getTagFaq: vi
         .fn()
-        .mockRejectedValue(invalidParams('bad_parameter: site', { reason: 'invalid_site' })),
+        .mockRejectedValue(validationError('bad_parameter: site', { reason: 'invalid_site' })),
     } as ReturnType<typeof getStackExchangeService>);
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'python', site: 'notasite' });

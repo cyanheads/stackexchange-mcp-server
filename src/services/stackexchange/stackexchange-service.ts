@@ -7,10 +7,10 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
-  invalidParams,
   notFound,
   rateLimited,
   serviceUnavailable,
+  validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
@@ -200,7 +200,7 @@ export class StackExchangeService {
           reason === 'invalid_id_or_url'
             ? `The question ID is not a valid Stack Exchange question ID.`
             : `Stack Exchange API error: ${errObj.error_message}`;
-        throw invalidParams(message, {
+        throw validationError(message, {
           reason,
           error_name: errObj.error_name,
           error_id: errObj.error_id,

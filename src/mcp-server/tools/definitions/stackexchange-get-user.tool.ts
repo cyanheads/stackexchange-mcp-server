@@ -91,7 +91,7 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
     },
     {
       reason: 'invalid_site',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
         'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',

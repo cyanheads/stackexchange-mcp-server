@@ -99,15 +99,15 @@ describe('stackexchangeGetThread handler', () => {
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: 'some-title-with-dashes' });
     await expect(stackexchangeGetThread.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
     });
   });
 
   it('throws invalid_id_or_url when service rejects the ID as bad_parameter (out-of-range integer)', async () => {
-    const { invalidParams } = await import('@cyanheads/mcp-ts-core/errors');
+    const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
     mockGetService.mockReturnValue({
       getThread: vi.fn().mockRejectedValue(
-        invalidParams('The question ID is not a valid Stack Exchange question ID.', {
+        validationError('The question ID is not a valid Stack Exchange question ID.', {
           reason: 'invalid_id_or_url',
         }),
       ),

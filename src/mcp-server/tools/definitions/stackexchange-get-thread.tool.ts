@@ -130,6 +130,9 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     quotaMax: z
       .number()
       .describe('Maximum API quota calls per day (300 keyless, ~10,000 with API key).'),
+    truncated: z.boolean().optional().describe('True when answers were capped at maxAnswers.'),
+    shown: z.number().optional().describe('Number of answers returned.'),
+    cap: z.number().optional().describe('The maxAnswers cap applied to this request.'),
   },
   enrichmentTrailer: {
     quotaRemaining: { label: 'Quota Remaining' },
@@ -146,14 +149,14 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     },
     {
       reason: 'invalid_site',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
         'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',
     },
     {
       reason: 'invalid_id_or_url',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The input is not a parseable integer ID and not a recognizable SE question URL.',
       recovery:
         'Provide a numeric question ID (e.g. "11227809") or a valid Stack Exchange question URL.',
@@ -188,6 +191,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     );
 
     ctx.enrich({ quotaRemaining, quotaMax });
+    ctx.enrich.truncated({ shown: thread.answers.length, cap: input.maxAnswers });
 
     ctx.log.info('Fetched SE thread', {
       questionId,

@@ -129,12 +129,12 @@ describe('stackexchangeSearchQuestions handler', () => {
   });
 
   it('propagates service errors (e.g. invalid_site → throws)', async () => {
-    const { invalidParams } = await import('@cyanheads/mcp-ts-core/errors');
+    const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
     mockGetService.mockReturnValue({
       searchQuestions: vi
         .fn()
         .mockRejectedValue(
-          invalidParams('bad_parameter: invalid site', { reason: 'invalid_site' }),
+          validationError('bad_parameter: invalid site', { reason: 'invalid_site' }),
         ),
     } as ReturnType<typeof getStackExchangeService>);
     const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });

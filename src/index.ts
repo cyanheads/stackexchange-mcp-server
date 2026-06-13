@@ -10,6 +10,8 @@ import { allToolDefinitions } from './mcp-server/tools/definitions/index.js';
 import { initStackExchangeService } from './services/stackexchange/stackexchange-service.js';
 
 await createApp({
+  name: 'stackexchange-mcp-server',
+  title: 'stackexchange-mcp-server',
   tools: allToolDefinitions,
   resources: [],
   prompts: [],

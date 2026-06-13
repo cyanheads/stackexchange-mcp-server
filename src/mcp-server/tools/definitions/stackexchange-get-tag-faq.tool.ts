@@ -76,6 +76,9 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     quotaMax: z
       .number()
       .describe('Maximum API quota calls per day (300 keyless, ~10,000 with API key).'),
+    truncated: z.boolean().optional().describe('True when results were capped at pageSize.'),
+    shown: z.number().optional().describe('Number of results returned.'),
+    cap: z.number().optional().describe('The pageSize cap applied to this request.'),
     notice: z
       .string()
       .optional()
@@ -89,7 +92,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
   errors: [
     {
       reason: 'invalid_site',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
         'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',
@@ -115,6 +118,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     );
 
     ctx.enrich({ quotaRemaining, quotaMax });
+    ctx.enrich.truncated({ shown: questions.length, cap: input.pageSize });
 
     if (questions.length === 0) {
       ctx.enrich.notice(
