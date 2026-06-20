@@ -1,6 +1,6 @@
 {
   "name": "stackexchange-mcp-server",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
   "author": {
     "name": "cyanheads",
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "stackexchange-mcp-server",
     "shortDescription": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
-    "longDescription": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
+    "longDescription": "Read-only access to the Stack Exchange network — Stack Overflow, Super User, Server Fault, Unix & Linux, and 180+ other sites. List sites to resolve an api_site_parameter, search questions by full-text query or browse a tag's FAQ to find question IDs, then fetch a complete Q&A thread with HTML bodies normalized to markdown. Resolve answer authors to user profiles by ID. Runs over STDIO or Streamable HTTP; keyless at ~300 requests/day per IP, or set STACKEXCHANGE_API_KEY for ~10,000/day.",
     "developerName": "cyanheads",
     "category": "developer-tools",
     "capabilities": ["Read"],

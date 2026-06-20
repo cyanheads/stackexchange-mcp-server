@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-06-20
+
+Framework maintenance: mcp-ts-core ^0.10.9 — new check-dependency-specifiers devcheck step, plugin-manifest packaging checks, fresh-scaffold devcheck guards, ctx.content skill sync; dev-dep refresh
+
 ## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-12
 
 Framework adoption (mcp-ts-core ^0.10.6); validationError reclassification for invalid_site/invalid_id_or_url; truncation enrichment on search/thread/FAQ; MCPB bundle cleaner and Docker healthcheck
