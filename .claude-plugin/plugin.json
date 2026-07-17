@@ -1,6 +1,6 @@
 {
   "name": "stackexchange-mcp-server",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
   "author": {
     "name": "cyanheads"

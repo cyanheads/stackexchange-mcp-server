@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-07-16
+
+search_questions: 'newest' sort now translates to SE's 'creation', and minScore forces sort=votes instead of erroring under the default relevance sort (#6, #10)
+
 ## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-07-16
 
 HTML-normalization fixes for non-BMP entities, SE code-block language capture, and author/location decoding (#8, #9, #12); mcp-ts-core ^0.10.9 → ^0.10.14 with Socket scanner supply-chain hardening
