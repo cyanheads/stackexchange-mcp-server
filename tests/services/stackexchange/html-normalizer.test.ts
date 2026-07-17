@@ -20,8 +20,9 @@ describe('normalizeHtml', () => {
       expect(result).toBe('```\nconst x = 1;\nconst y = 2;\n```');
     });
 
-    it('preserves language hint from class attribute', () => {
-      const html = '<pre><code class="language-python">def foo():\n    pass</code></pre>';
+    it('captures the language hint from the pre lang-* class', () => {
+      const html =
+        '<pre class="lang-python prettyprint-override"><code>def foo():\n    pass</code></pre>';
       const result = normalizeHtml(html);
       expect(result).toBe('```python\ndef foo():\n    pass\n```');
     });
@@ -38,13 +39,23 @@ describe('normalizeHtml', () => {
       expect(result).toContain('x = 1;');
     });
 
-    it('preserves < > literals in code blocks with SE lang-* class', () => {
-      // SE uses lang-* (not language-*) for its prettyprint classes; the second
-      // regex (no language hint) handles these. Entities must still decode.
+    it('captures the SE lang-* language and preserves < > literals', () => {
+      // SE marks code as <pre class="lang-cpp ...">, not <code class="language-...">;
+      // the language is read from the <pre> class and entities still decode.
       const html =
         '<pre class="lang-cpp prettyprint-override"><code>if (x &lt; 0) return;</code></pre>';
       const result = normalizeHtml(html);
-      expect(result).toBe('```\nif (x < 0) return;\n```');
+      expect(result).toBe('```cpp\nif (x < 0) return;\n```');
+    });
+
+    it('captures the language- prefix on the pre class too', () => {
+      const html = '<pre class="language-rust"><code>let x = 1;</code></pre>';
+      expect(normalizeHtml(html)).toBe('```rust\nlet x = 1;\n```');
+    });
+
+    it('falls back to a bare fence when the pre carries no language class', () => {
+      const html = '<pre class="prettyprint-override"><code>plain();</code></pre>';
+      expect(normalizeHtml(html)).toBe('```\nplain();\n```');
     });
 
     it('wraps code in triple backtick fences (not inline backtick)', () => {
@@ -189,6 +200,22 @@ describe('normalizeHtml', () => {
       // &#x41; = 'A'
       expect(normalizeHtml('&#x41;')).toContain('A');
     });
+
+    it('decodes non-BMP decimal entities (emoji above U+FFFF)', () => {
+      // &#128105; = 👩 (U+1F469). String.fromCharCode truncated this to a bogus
+      // BMP glyph; String.fromCodePoint yields the correct astral character.
+      expect(normalizeHtml('&#128105;')).toBe('👩');
+    });
+
+    it('decodes non-BMP hex entities', () => {
+      // &#x1F469; = 👩 (U+1F469)
+      expect(normalizeHtml('&#x1F469;')).toBe('👩');
+    });
+
+    it('maps out-of-range numeric entities to the replacement character', () => {
+      // > U+10FFFF is invalid; decode to U+FFFD rather than throwing a RangeError.
+      expect(normalizeHtml('&#99999999;')).toBe('�');
+    });
   });
 
   describe('excessive blank lines', () => {
@@ -221,13 +248,20 @@ describe('normalizeHtml', () => {
     it('leaves already-decoded strings unchanged', () => {
       expect(decodeHtmlEntities("Why can't I store a value?")).toBe("Why can't I store a value?");
     });
+
+    it('decodes non-BMP numeric entities in plain-text fields', () => {
+      // The exported helper backs display-name/location decoding — astral code
+      // points (emoji, rare CJK) must survive intact.
+      expect(decodeHtmlEntities('woman: &#128105;')).toBe('woman: 👩');
+      expect(decodeHtmlEntities('woman: &#x1F469;')).toBe('woman: 👩');
+    });
   });
 
   describe('real-world SE snippet', () => {
     it('handles a typical SE answer body with code and explanation', () => {
       const html = [
         '<p>Use <code>Array.from()</code> to convert:</p>',
-        '<pre><code class="language-javascript">const arr = Array.from(set);</code></pre>',
+        '<pre class="lang-javascript prettyprint-override"><code>const arr = Array.from(set);</code></pre>',
         '<p>This preserves insertion order.</p>',
       ].join('');
       const result = normalizeHtml(html);

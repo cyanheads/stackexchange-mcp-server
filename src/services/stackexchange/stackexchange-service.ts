@@ -324,15 +324,14 @@ export class StackExchangeService {
           });
         }
 
-        if (questionWrapper.items.length === 0) {
+        const q = questionWrapper.items[0];
+        if (!q) {
           throw notFound(`Question ID ${opts.questionId} not found on site "${opts.site}".`, {
             reason: 'question_not_found',
             questionId: opts.questionId,
             site: opts.site,
           });
         }
-
-        const q = questionWrapper.items[0]!;
 
         // Sort answers: accepted first, then by score descending
         const answers = answersWrapper.items.slice().sort((a, b) => {
@@ -347,7 +346,9 @@ export class StackExchangeService {
           score: a.score,
           isAccepted: a.is_accepted,
           bodyMarkdown: normalizeHtml(a.body ?? ''),
-          ...(a.owner?.display_name ? { authorName: a.owner.display_name } : {}),
+          ...(a.owner?.display_name
+            ? { authorName: decodeHtmlEntities(a.owner.display_name) }
+            : {}),
           ...(a.owner?.link ? { authorLink: a.owner.link } : {}),
           ...(a.owner?.reputation !== undefined ? { authorReputation: a.owner.reputation } : {}),
           ...(a.owner?.user_id !== undefined ? { authorUserId: a.owner.user_id } : {}),
@@ -360,7 +361,9 @@ export class StackExchangeService {
           score: q.score,
           tags: q.tags,
           bodyMarkdown: normalizeHtml(q.body ?? ''),
-          ...(q.owner?.display_name ? { authorName: q.owner.display_name } : {}),
+          ...(q.owner?.display_name
+            ? { authorName: decodeHtmlEntities(q.owner.display_name) }
+            : {}),
           ...(q.owner?.link ? { authorLink: q.owner.link } : {}),
           ...(q.owner?.user_id !== undefined ? { authorUserId: q.owner.user_id } : {}),
           answers: normalizedAnswers,
@@ -458,15 +461,14 @@ export class StackExchangeService {
           });
         }
 
-        if (profileWrapper.items.length === 0) {
+        const u = profileWrapper.items[0];
+        if (!u) {
           throw notFound(`User ID ${opts.userId} not found on site "${opts.site}".`, {
             reason: 'user_not_found',
             userId: opts.userId,
             site: opts.site,
           });
         }
-
-        const u = profileWrapper.items[0]!;
         const topTags = topTagsWrapper.items.map((t) => ({
           tagName: t.tag_name,
           ...(t.answer_count !== undefined ? { answerCount: t.answer_count } : {}),
@@ -475,11 +477,11 @@ export class StackExchangeService {
 
         const user: NormalizedUser = {
           userId: u.user_id,
-          displayName: u.display_name,
+          displayName: decodeHtmlEntities(u.display_name),
           link: u.link,
           reputation: u.reputation,
           ...(u.badge_counts ? { badgeCounts: u.badge_counts } : {}),
-          ...(u.location ? { location: u.location } : {}),
+          ...(u.location ? { location: decodeHtmlEntities(u.location) } : {}),
           ...(u.website_url ? { websiteUrl: u.website_url } : {}),
           topTags,
           ...(u.answer_count !== undefined ? { answerCount: u.answer_count } : {}),

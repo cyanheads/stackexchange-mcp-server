@@ -23,9 +23,10 @@ export function normalizeHtml(html: string): string {
   // decodeEntities() call at the end of this function.
 
   // Fenced code blocks: <pre><code>...</code></pre> → ```\n...\n```
-  // SE wraps code blocks in both tags; capture the language hint from class if present.
+  // SE marks the language on the <pre> class (e.g. <pre class="lang-cpp prettyprint-override">),
+  // not on <code> — capture the lang-/language- token from the <pre> class when present.
   md = md.replace(
-    /<pre[^>]*>\s*<code[^>]*class="[^"]*language-([^"\s]+)[^"]*"[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/gi,
+    /<pre[^>]*class="[^"]*?\blang(?:uage)?-([^"\s]+)[^"]*"[^>]*>\s*<code[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/gi,
     (_, lang: string, code: string) => {
       const cleaned = stripTags(code)
         .replace(/&amp;/g, '&')
@@ -177,6 +178,18 @@ export function decodeHtmlEntities(text: string): string {
   return decodeEntities(text);
 }
 
+/**
+ * Decode a numeric character reference to a string. Per the HTML5 rules, an
+ * out-of-range (> U+10FFFF) or surrogate (U+D800–U+DFFF) code point yields the
+ * replacement character — and String.fromCodePoint (unlike the truncating
+ * String.fromCharCode it replaces) throws a RangeError on out-of-range input,
+ * so those values must be handled before the call.
+ */
+function decodeCodePoint(code: number): string {
+  if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '�';
+  return String.fromCodePoint(code);
+}
+
 /** Decode basic HTML entities. */
 function decodeEntities(text: string): string {
   return text
@@ -187,6 +200,6 @@ function decodeEntities(text: string): string {
     .replace(/&#39;/g, "'")
     .replace(/&apos;/g, "'")
     .replace(/&nbsp;/g, ' ')
-    .replace(/&#(\d+);/g, (_, code: string) => String.fromCharCode(parseInt(code, 10)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+    .replace(/&#(\d+);/g, (_, code: string) => decodeCodePoint(parseInt(code, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => decodeCodePoint(parseInt(hex, 16)));
 }
