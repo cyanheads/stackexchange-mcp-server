@@ -136,7 +136,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
   async handler(input, ctx) {
     const svc = getStackExchangeService();
     const filteredTags = input.tags?.filter(Boolean);
-    const { questions, quotaRemaining, quotaMax } = await svc.searchQuestions(
+    const { questions, quotaRemaining, quotaMax, hasMore } = await svc.searchQuestions(
       {
         query: input.query,
         site: input.site,
@@ -150,7 +150,9 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
     );
 
     ctx.enrich({ quotaRemaining, quotaMax });
-    ctx.enrich.truncated({ shown: questions.length, cap: input.pageSize });
+    if (questions.length >= input.pageSize && hasMore) {
+      ctx.enrich.truncated({ shown: questions.length, cap: input.pageSize });
+    }
 
     if (questions.length === 0) {
       ctx.enrich.notice(

@@ -168,3 +168,207 @@ describe('StackExchangeService.searchQuestions sort/min mapping', () => {
     expect(url.searchParams.get('min')).toBeNull();
   });
 });
+
+describe('StackExchangeService.getThread accepted-answer merge', () => {
+  /** Matches the explicit single-answer fetch (/answers/{id}), not the /questions/{id}/answers page. */
+  const isAcceptedAnswerFetch = (url: string) => /\/answers\/\d+/.test(url);
+
+  it('fetches the accepted answer when it falls outside the top-maxAnswers votes page and lists it first', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (isAcceptedAnswerFetch(url)) {
+        return jsonResponse({
+          items: [
+            {
+              answer_id: 2241883,
+              question_id: 2241875,
+              score: 500,
+              is_accepted: true,
+              body: '<p>The accepted answer.</p>',
+            },
+          ],
+          has_more: false,
+          quota_remaining: 95,
+          quota_max: 300,
+        });
+      }
+      if (url.includes('/answers')) {
+        return jsonResponse({
+          items: [
+            {
+              answer_id: 25333702,
+              question_id: 2241875,
+              score: 900,
+              is_accepted: false,
+              body: '<p>A higher-voted, non-accepted answer.</p>',
+            },
+          ],
+          has_more: true,
+          quota_remaining: 96,
+          quota_max: 300,
+        });
+      }
+      return jsonResponse({
+        items: [
+          {
+            question_id: 2241875,
+            title: 'A capped thread',
+            link: 'https://stackoverflow.com/q/2241875',
+            score: 100,
+            answer_count: 12,
+            is_answered: true,
+            tags: ['python'],
+            body: '<p>Question body.</p>',
+            accepted_answer_id: 2241883,
+          },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      });
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: 2241875, maxAnswers: 1 },
+      createMockContext(),
+    );
+
+    // Accepted answer is present despite ranking below the top-1 by votes...
+    expect(thread.answers.map((a) => a.answerId)).toContain(2241883);
+    // ...and sorts ahead of the higher-voted, non-accepted answer.
+    expect(thread.answers[0]?.answerId).toBe(2241883);
+    expect(thread.answers[0]?.isAccepted).toBe(true);
+    // maxAnswers=1 page (1) + merged accepted (1) = 2 — completeness beats the cap.
+    expect(thread.answers).toHaveLength(2);
+    // Total surfaced from the question's answer_count.
+    expect(thread.answerCount).toBe(12);
+    // Three upstream calls: question, answers page, explicit accepted fetch.
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('skips the extra fetch when the accepted answer is already in the page', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (isAcceptedAnswerFetch(url)) {
+        throw new Error('accepted answer already present — no explicit fetch expected');
+      }
+      if (url.includes('/answers')) {
+        return jsonResponse({
+          items: [
+            { answer_id: 100, question_id: 1, score: 50, is_accepted: false, body: '<p>A.</p>' },
+            {
+              answer_id: 200,
+              question_id: 1,
+              score: 40,
+              is_accepted: true,
+              body: '<p>Accepted.</p>',
+            },
+          ],
+          has_more: false,
+          quota_remaining: 96,
+          quota_max: 300,
+        });
+      }
+      return jsonResponse({
+        items: [
+          {
+            question_id: 1,
+            title: 'Complete thread',
+            link: 'https://stackoverflow.com/q/1',
+            score: 10,
+            answer_count: 2,
+            is_answered: true,
+            tags: ['c'],
+            body: '<p>Q.</p>',
+            accepted_answer_id: 200,
+          },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      });
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: 1, maxAnswers: 10 },
+      createMockContext(),
+    );
+
+    // Accepted (200) sorts first even though its score (40) is below answer 100 (50).
+    expect(thread.answers[0]?.answerId).toBe(200);
+    expect(thread.answers[0]?.isAccepted).toBe(true);
+    expect(thread.answers).toHaveLength(2);
+    expect(thread.answerCount).toBe(2);
+    // Only two calls — question + answers page. No third fetch.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not fetch an accepted answer when the question has none', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (isAcceptedAnswerFetch(url)) {
+        throw new Error('no accepted answer exists — no explicit fetch expected');
+      }
+      if (url.includes('/answers')) {
+        return jsonResponse({
+          items: [
+            { answer_id: 5, question_id: 3, score: 7, is_accepted: false, body: '<p>A.</p>' },
+          ],
+          has_more: false,
+          quota_remaining: 96,
+          quota_max: 300,
+        });
+      }
+      return jsonResponse({
+        items: [
+          {
+            question_id: 3,
+            title: 'Unaccepted thread',
+            link: 'https://stackoverflow.com/q/3',
+            score: 4,
+            answer_count: 1,
+            is_answered: false,
+            tags: ['go'],
+            body: '<p>Q.</p>',
+          },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      });
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: 3 },
+      createMockContext(),
+    );
+
+    expect(thread.acceptedAnswerId).toBeUndefined();
+    expect(thread.answerCount).toBe(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('StackExchangeService hasMore threading', () => {
+  it('searchQuestions surfaces the wrapper has_more flag', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      jsonResponse({ items: [], has_more: true, quota_remaining: 100, quota_max: 300 }),
+    );
+    const { hasMore } = await makeService().searchQuestions(
+      { query: 'q', site: 'stackoverflow' },
+      createMockContext(),
+    );
+    expect(hasMore).toBe(true);
+  });
+
+  it('getTagFaq surfaces the wrapper has_more flag', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      jsonResponse({ items: [], has_more: false, quota_remaining: 100, quota_max: 300 }),
+    );
+    const { hasMore } = await makeService().getTagFaq(
+      { tag: 'python', site: 'stackoverflow' },
+      createMockContext(),
+    );
+    expect(hasMore).toBe(false);
+  });
+});

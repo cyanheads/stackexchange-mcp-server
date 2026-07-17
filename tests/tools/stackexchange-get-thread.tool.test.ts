@@ -46,6 +46,7 @@ const makeThread = (overrides: Partial<NormalizedThread> = {}): NormalizedThread
   authorName: 'SUser',
   authorLink: 'https://stackoverflow.com/users/2/suser',
   acceptedAnswerId: 11227846,
+  answerCount: 1,
   answers: [makeAnswer()],
   ...overrides,
 });
@@ -304,5 +305,56 @@ describe('stackexchangeGetThread format', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).not.toContain('Accepted Answer ID');
     expect(text).not.toContain('undefined');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// truncated enrichment gating (#7) + answerCount surfacing (#11)
+// ---------------------------------------------------------------------------
+describe('stackexchangeGetThread truncation enrichment', () => {
+  it('fires truncated when fewer answers are shown than the total answerCount', async () => {
+    const thread = makeThread({ answerCount: 27, answers: [makeAnswer()] });
+    mockGetService.mockReturnValue(
+      makeThreadResult(thread) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeGetThread.input.parse({
+      questionIdOrUrl: '11227809',
+      maxAnswers: 1,
+    });
+    await stackexchangeGetThread.handler(input, ctx);
+    expect(truncatedSpy).toHaveBeenCalledOnce();
+  });
+
+  it('omits truncated when every answer is shown (answers.length === answerCount)', async () => {
+    const thread = makeThread({ answerCount: 1, answers: [makeAnswer()] });
+    mockGetService.mockReturnValue(
+      makeThreadResult(thread) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
+    await stackexchangeGetThread.handler(input, ctx);
+    expect(truncatedSpy).not.toHaveBeenCalled();
+  });
+
+  it('passes answerCount through the handler unchanged', async () => {
+    const thread = makeThread({ answerCount: 27 });
+    mockGetService.mockReturnValue(
+      makeThreadResult(thread) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
+    const result = await stackexchangeGetThread.handler(input, ctx);
+    expect(result.answerCount).toBe(27);
+  });
+});
+
+describe('stackexchangeGetThread format answerCount', () => {
+  it('renders the total answer count in the header', () => {
+    const thread = makeThread({ answerCount: 999 });
+    const text = (stackexchangeGetThread.format!(thread)[0] as { text: string }).text;
+    expect(text).toContain('999');
   });
 });

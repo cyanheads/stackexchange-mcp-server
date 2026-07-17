@@ -77,6 +77,13 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     title: z.string().describe('Question title.'),
     link: z.string().describe('Direct URL to the question.'),
     score: z.number().int().describe('Question score (upvotes minus downvotes).'),
+    answerCount: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Total answers the question has upstream. When greater than the returned answers[] length, more answers exist — raise maxAnswers to fetch them.',
+      ),
     tags: z
       .array(z.string().describe('A tag applied to this question.'))
       .describe('Tags applied to this question.'),
@@ -191,7 +198,9 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     );
 
     ctx.enrich({ quotaRemaining, quotaMax });
-    ctx.enrich.truncated({ shown: thread.answers.length, cap: input.maxAnswers });
+    if (thread.answers.length < thread.answerCount) {
+      ctx.enrich.truncated({ shown: thread.answers.length, cap: input.maxAnswers });
+    }
 
     ctx.log.info('Fetched SE thread', {
       questionId,
@@ -207,7 +216,9 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
 
     // Question header
     lines.push(`# ${result.title}`);
-    lines.push(`**Question ID:** ${result.questionId} | **Score:** ${result.score}`);
+    const statParts = [`**Question ID:** ${result.questionId}`, `**Score:** ${result.score}`];
+    if (result.answerCount != null) statParts.push(`**Answers:** ${result.answerCount}`);
+    lines.push(statParts.join(' | '));
     lines.push(`**Tags:** ${result.tags.join(', ')}`);
     lines.push(`**Link:** ${result.link}`);
     if (result.authorName) {

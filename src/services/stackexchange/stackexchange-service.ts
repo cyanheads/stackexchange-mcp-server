@@ -110,6 +110,7 @@ export interface NormalizedAnswer {
 /** Normalized thread for tool output. */
 export interface NormalizedThread {
   acceptedAnswerId?: number;
+  answerCount: number;
   answers: NormalizedAnswer[];
   authorLink?: string;
   authorName?: string;
@@ -236,6 +237,7 @@ export class StackExchangeService {
     questions: NormalizedQuestion[];
     quotaRemaining: number;
     quotaMax: number;
+    hasMore: boolean;
   }> {
     return withRetry(
       async () => {
@@ -293,7 +295,12 @@ export class StackExchangeService {
           ...(q.excerpt ? { excerpt: decodeHtmlEntities(q.excerpt) } : {}),
         }));
 
-        return { questions, quotaRemaining: wrapper.quota_remaining, quotaMax: wrapper.quota_max };
+        return {
+          questions,
+          quotaRemaining: wrapper.quota_remaining,
+          quotaMax: wrapper.quota_max,
+          hasMore: wrapper.has_more,
+        };
       },
       {
         operation: 'searchQuestions',
@@ -348,8 +355,28 @@ export class StackExchangeService {
           });
         }
 
+        // The answers page is sorted by votes, so an accepted answer ranked below
+        // the top-maxAnswers is never in it. Pull it explicitly and merge it in —
+        // one extra call, only in the miss case — so the thread never reports an
+        // acceptedAnswerId whose body is absent from answers[].
+        const answerItems = answersWrapper.items.slice();
+        if (
+          q.accepted_answer_id !== undefined &&
+          !answerItems.some((a) => a.answer_id === q.accepted_answer_id)
+        ) {
+          const acceptedUrl = this.buildUrl(`/answers/${q.accepted_answer_id}`, {
+            site: opts.site,
+            filter: 'withbody',
+          });
+          const acceptedWrapper = await this.fetchSe<SeAnswer>(acceptedUrl, ctx);
+          const acceptedAnswer = acceptedWrapper.items[0];
+          if (acceptedAnswer) {
+            answerItems.push(acceptedAnswer);
+          }
+        }
+
         // Sort answers: accepted first, then by score descending
-        const answers = answersWrapper.items.slice().sort((a, b) => {
+        const answers = answerItems.sort((a, b) => {
           const aAccepted = a.answer_id === q.accepted_answer_id ? 1 : 0;
           const bAccepted = b.answer_id === q.accepted_answer_id ? 1 : 0;
           if (aAccepted !== bAccepted) return bAccepted - aAccepted;
@@ -381,6 +408,7 @@ export class StackExchangeService {
             : {}),
           ...(q.owner?.link ? { authorLink: q.owner.link } : {}),
           ...(q.owner?.user_id !== undefined ? { authorUserId: q.owner.user_id } : {}),
+          answerCount: q.answer_count,
           answers: normalizedAnswers,
           ...(q.accepted_answer_id !== undefined ? { acceptedAnswerId: q.accepted_answer_id } : {}),
         };
@@ -408,6 +436,7 @@ export class StackExchangeService {
     questions: NormalizedQuestion[];
     quotaRemaining: number;
     quotaMax: number;
+    hasMore: boolean;
   }> {
     return withRetry(
       async () => {
@@ -435,7 +464,12 @@ export class StackExchangeService {
           tags: q.tags,
         }));
 
-        return { questions, quotaRemaining: wrapper.quota_remaining, quotaMax: wrapper.quota_max };
+        return {
+          questions,
+          quotaRemaining: wrapper.quota_remaining,
+          quotaMax: wrapper.quota_max,
+          hasMore: wrapper.has_more,
+        };
       },
       {
         operation: 'getTagFaq',

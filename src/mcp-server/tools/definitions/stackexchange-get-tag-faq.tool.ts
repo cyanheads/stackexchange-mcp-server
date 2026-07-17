@@ -108,7 +108,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
 
   async handler(input, ctx) {
     const svc = getStackExchangeService();
-    const { questions, quotaRemaining, quotaMax } = await svc.getTagFaq(
+    const { questions, quotaRemaining, quotaMax, hasMore } = await svc.getTagFaq(
       {
         tag: input.tag,
         site: input.site,
@@ -118,7 +118,9 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     );
 
     ctx.enrich({ quotaRemaining, quotaMax });
-    ctx.enrich.truncated({ shown: questions.length, cap: input.pageSize });
+    if (questions.length >= input.pageSize && hasMore) {
+      ctx.enrich.truncated({ shown: questions.length, cap: input.pageSize });
+    }
 
     if (questions.length === 0) {
       ctx.enrich.notice(

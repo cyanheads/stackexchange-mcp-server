@@ -32,8 +32,8 @@ const makeFaqQuestion = (overrides: Partial<NormalizedQuestion> = {}): Normalize
   ...overrides,
 });
 
-const makeFaqResult = (questions: NormalizedQuestion[] = [makeFaqQuestion()]) => ({
-  getTagFaq: vi.fn().mockResolvedValue({ questions, quotaRemaining: 250, quotaMax: 300 }),
+const makeFaqResult = (questions: NormalizedQuestion[] = [makeFaqQuestion()], hasMore = false) => ({
+  getTagFaq: vi.fn().mockResolvedValue({ questions, quotaRemaining: 250, quotaMax: 300, hasMore }),
 });
 
 beforeEach(() => {
@@ -187,5 +187,46 @@ describe('stackexchangeGetTagFaq format', () => {
     };
     const blocks = stackexchangeGetTagFaq.format!(output);
     expect((blocks[0] as { text: string }).text).not.toContain('undefined');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// truncated enrichment gating (#7)
+// ---------------------------------------------------------------------------
+describe('stackexchangeGetTagFaq truncation enrichment', () => {
+  const fullPage = () =>
+    Array.from({ length: 5 }, (_, i) => makeFaqQuestion({ questionId: 1000 + i }));
+
+  it('fires truncated when the page is filled and the upstream has more', async () => {
+    mockGetService.mockReturnValue(
+      makeFaqResult(fullPage(), true) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeGetTagFaq.input.parse({ tag: 'java', pageSize: 5 });
+    await stackexchangeGetTagFaq.handler(input, ctx);
+    expect(truncatedSpy).toHaveBeenCalledOnce();
+  });
+
+  it('omits truncated when the page is filled but the upstream has no more', async () => {
+    mockGetService.mockReturnValue(
+      makeFaqResult(fullPage(), false) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeGetTagFaq.input.parse({ tag: 'java', pageSize: 5 });
+    await stackexchangeGetTagFaq.handler(input, ctx);
+    expect(truncatedSpy).not.toHaveBeenCalled();
+  });
+
+  it('omits truncated when fewer results than the page cap are returned', async () => {
+    mockGetService.mockReturnValue(
+      makeFaqResult([makeFaqQuestion()], true) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeGetTagFaq.input.parse({ tag: 'java', pageSize: 5 });
+    await stackexchangeGetTagFaq.handler(input, ctx);
+    expect(truncatedSpy).not.toHaveBeenCalled();
   });
 });

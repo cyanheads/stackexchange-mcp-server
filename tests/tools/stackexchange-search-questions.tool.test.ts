@@ -30,11 +30,12 @@ const makeQuestion = (overrides: Partial<NormalizedQuestion> = {}): NormalizedQu
   ...overrides,
 });
 
-const makeSearchResult = (questions: NormalizedQuestion[] = [makeQuestion()]) => ({
+const makeSearchResult = (questions: NormalizedQuestion[] = [makeQuestion()], hasMore = false) => ({
   searchQuestions: vi.fn().mockResolvedValue({
     questions,
     quotaRemaining: 250,
     quotaMax: 300,
+    hasMore,
   }),
 });
 
@@ -204,5 +205,46 @@ describe('stackexchangeSearchQuestions format', () => {
     expect(blocks[0]!.type).toBe('text');
     // Should not crash or contain "undefined"
     expect((blocks[0] as { text: string }).text).not.toContain('undefined');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// truncated enrichment gating (#7)
+// ---------------------------------------------------------------------------
+describe('stackexchangeSearchQuestions truncation enrichment', () => {
+  const fullPage = () =>
+    Array.from({ length: 5 }, (_, i) => makeQuestion({ questionId: 1000 + i }));
+
+  it('fires truncated when the page is filled and the upstream has more', async () => {
+    mockGetService.mockReturnValue(
+      makeSearchResult(fullPage(), true) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext();
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5 });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(truncatedSpy).toHaveBeenCalledOnce();
+  });
+
+  it('omits truncated when the page is filled but the upstream has no more', async () => {
+    mockGetService.mockReturnValue(
+      makeSearchResult(fullPage(), false) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext();
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5 });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(truncatedSpy).not.toHaveBeenCalled();
+  });
+
+  it('omits truncated when fewer results than the page cap are returned', async () => {
+    mockGetService.mockReturnValue(
+      makeSearchResult([makeQuestion()], true) as ReturnType<typeof getStackExchangeService>,
+    );
+    const ctx = createMockContext();
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5 });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(truncatedSpy).not.toHaveBeenCalled();
   });
 });
