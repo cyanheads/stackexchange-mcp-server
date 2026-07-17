@@ -1,6 +1,6 @@
 # stackexchange-mcp-server - Directory Structure
 
-Generated on: 2026-06-20 18:17:37
+Generated on: 2026-07-17 00:17:12
 
 ```text
 stackexchange-mcp-server/
@@ -11,10 +11,12 @@ stackexchange-mcp-server/
 │   ├── mcp.json
 │   └── plugin.json
 ├── .github/
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.yml
-│       ├── config.yml
-│       └── feature_request.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── config.yml
+│   │   └── feature_request.yml
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -152,7 +154,8 @@ stackexchange-mcp-server/
 │   ├── resources/
 │   ├── services/
 │   │   └── stackexchange/
-│   │       └── html-normalizer.test.ts
+│   │       ├── html-normalizer.test.ts
+│   │       └── stackexchange-service.test.ts
 │   └── tools/
 │       ├── stackexchange-get-tag-faq.tool.test.ts
 │       ├── stackexchange-get-thread.tool.test.ts
@@ -161,6 +164,7 @@ stackexchange-mcp-server/
 │       └── stackexchange-search-questions.tool.test.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── AGENTS.md

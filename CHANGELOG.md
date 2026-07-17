@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-07-16
+
+HTML-normalization fixes for non-BMP entities, SE code-block language capture, and author/location decoding (#8, #9, #12); mcp-ts-core ^0.10.9 → ^0.10.14 with Socket scanner supply-chain hardening
+
 ## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-06-20
 
 Framework maintenance: mcp-ts-core ^0.10.9 — new check-dependency-specifiers devcheck step, plugin-manifest packaging checks, fresh-scaffold devcheck guards, ctx.content skill sync; dev-dep refresh
