@@ -43,7 +43,9 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       .number()
       .int()
       .optional()
-      .describe('Minimum question score — excludes questions with lower scores.'),
+      .describe(
+        'Minimum question score — excludes questions with lower scores. Setting minScore orders results by score (votes), which may differ from the requested sort.',
+      ),
     sort: z
       .enum(['relevance', 'votes', 'activity', 'newest'])
       .default('relevance')

@@ -239,12 +239,27 @@ export class StackExchangeService {
   }> {
     return withRetry(
       async () => {
+        /**
+         * Resolve one effective SE sort. SE `min` constrains the current sort
+         * field (not score), so a minScore filter forces `votes` — its only
+         * score-sorted mode; otherwise it errors under `relevance` or filters by
+         * date under `activity`. Without minScore, the `newest` facade maps to
+         * SE's `creation` (SE accepts only activity|creation|votes|relevance);
+         * every other value passes through 1:1.
+         */
+        const requestedSort = opts.sort ?? 'relevance';
+        const sort =
+          opts.minScore !== undefined
+            ? 'votes'
+            : requestedSort === 'newest'
+              ? 'creation'
+              : requestedSort;
+
         const params: Record<string, string | number | boolean | undefined> = {
           site: opts.site,
           q: opts.query,
-          sort: opts.sort ?? 'relevance',
+          sort,
           pagesize: opts.pageSize ?? 10,
-          intitle: undefined,
         };
         if (opts.tags && opts.tags.length > 0) {
           params.tagged = opts.tags.join(';');
