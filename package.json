@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/stackexchange-mcp-server",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "mcpName": "io.github.cyanheads/stackexchange-mcp-server",
   "description": "Search Stack Exchange questions, fetch complete Q&A threads as clean markdown, browse tag FAQs, and look up user profiles via MCP. STDIO or Streamable HTTP.",
   "type": "module",

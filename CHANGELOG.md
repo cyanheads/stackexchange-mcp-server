@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-07-16
+
+search_questions, get_tag_faq, and get_thread now flag truncated only on genuine capping; get_thread also merges in an out-of-page accepted answer and surfaces answerCount (#7, #11)
+
 ## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-07-16
 
 search_questions: 'newest' sort now translates to SE's 'creation', and minScore forces sort=votes instead of erroring under the default relevance sort (#6, #10)
