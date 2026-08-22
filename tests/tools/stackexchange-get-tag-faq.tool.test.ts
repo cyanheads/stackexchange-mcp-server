@@ -21,6 +21,10 @@ import { getStackExchangeService } from '@/services/stackexchange/stackexchange-
 
 const mockGetService = vi.mocked(getStackExchangeService);
 
+const mockService = (service: Partial<ReturnType<typeof getStackExchangeService>>): void => {
+  mockGetService.mockReturnValue(service as ReturnType<typeof getStackExchangeService>);
+};
+
 const makeFaqQuestion = (overrides: Partial<NormalizedQuestion> = {}): NormalizedQuestion => ({
   questionId: 11227809,
   title: 'Why is processing a sorted array faster than processing an unsorted array?',
@@ -45,7 +49,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 describe('stackexchangeGetTagFaq handler', () => {
   it('returns questions for a valid tag', async () => {
-    mockGetService.mockReturnValue(makeFaqResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeFaqResult());
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'java' });
     const result = await stackexchangeGetTagFaq.handler(input, ctx);
@@ -57,7 +61,7 @@ describe('stackexchangeGetTagFaq handler', () => {
 
   it('defaults site to stackoverflow and pageSize to 10', async () => {
     const svc = makeFaqResult();
-    mockGetService.mockReturnValue(svc as ReturnType<typeof getStackExchangeService>);
+    mockService(svc);
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'python' });
     await stackexchangeGetTagFaq.handler(input, ctx);
@@ -68,7 +72,7 @@ describe('stackexchangeGetTagFaq handler', () => {
   });
 
   it('returns empty questions array when API returns no results (HTTP 200, items=[])', async () => {
-    mockGetService.mockReturnValue(makeFaqResult([]) as ReturnType<typeof getStackExchangeService>);
+    mockService(makeFaqResult([]));
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'nonexistent-tag-xyz' });
     const result = await stackexchangeGetTagFaq.handler(input, ctx);
@@ -77,7 +81,7 @@ describe('stackexchangeGetTagFaq handler', () => {
   });
 
   it('calls ctx.enrich.notice when tag returns no results', async () => {
-    mockGetService.mockReturnValue(makeFaqResult([]) as ReturnType<typeof getStackExchangeService>);
+    mockService(makeFaqResult([]));
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'nonexistent-tag-xyz' });
@@ -88,11 +92,11 @@ describe('stackexchangeGetTagFaq handler', () => {
 
   it('propagates service errors (invalid_site → throws)', async () => {
     const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
-    mockGetService.mockReturnValue({
+    mockService({
       getTagFaq: vi
         .fn()
         .mockRejectedValue(validationError('bad_parameter: site', { reason: 'invalid_site' })),
-    } as ReturnType<typeof getStackExchangeService>);
+    });
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'python', site: 'notasite' });
     await expect(stackexchangeGetTagFaq.handler(input, ctx)).rejects.toThrow();
@@ -100,7 +104,7 @@ describe('stackexchangeGetTagFaq handler', () => {
 
   it('passes custom site and pageSize to service', async () => {
     const svc = makeFaqResult();
-    mockGetService.mockReturnValue(svc as ReturnType<typeof getStackExchangeService>);
+    mockService(svc);
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const input = stackexchangeGetTagFaq.input.parse({
       tag: 'bash',
@@ -198,9 +202,7 @@ describe('stackexchangeGetTagFaq truncation enrichment', () => {
     Array.from({ length: 5 }, (_, i) => makeFaqQuestion({ questionId: 1000 + i }));
 
   it('fires truncated when the page is filled and the upstream has more', async () => {
-    mockGetService.mockReturnValue(
-      makeFaqResult(fullPage(), true) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeFaqResult(fullPage(), true));
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'java', pageSize: 5 });
@@ -209,9 +211,7 @@ describe('stackexchangeGetTagFaq truncation enrichment', () => {
   });
 
   it('omits truncated when the page is filled but the upstream has no more', async () => {
-    mockGetService.mockReturnValue(
-      makeFaqResult(fullPage(), false) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeFaqResult(fullPage(), false));
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'java', pageSize: 5 });
@@ -220,9 +220,7 @@ describe('stackexchangeGetTagFaq truncation enrichment', () => {
   });
 
   it('omits truncated when fewer results than the page cap are returned', async () => {
-    mockGetService.mockReturnValue(
-      makeFaqResult([makeFaqQuestion()], true) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeFaqResult([makeFaqQuestion()], true));
     const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'java', pageSize: 5 });

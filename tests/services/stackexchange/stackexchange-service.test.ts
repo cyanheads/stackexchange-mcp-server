@@ -158,15 +158,14 @@ describe('StackExchangeService.searchQuestions sort/min mapping', () => {
     expect(url.searchParams.get('min')).toBe('50');
   });
 
-  it.each([
-    'relevance',
-    'votes',
-    'activity',
-  ] as const)('passes sort=%s through unchanged and omits min', async (sort) => {
-    const url = await captureSearchUrl({ query: 'q', site: 'stackoverflow', sort });
-    expect(url.searchParams.get('sort')).toBe(sort);
-    expect(url.searchParams.get('min')).toBeNull();
-  });
+  it.each(['relevance', 'votes', 'activity'] as const)(
+    'passes sort=%s through unchanged and omits min',
+    async (sort) => {
+      const url = await captureSearchUrl({ query: 'q', site: 'stackoverflow', sort });
+      expect(url.searchParams.get('sort')).toBe(sort);
+      expect(url.searchParams.get('min')).toBeNull();
+    },
+  );
 });
 
 describe('StackExchangeService.getThread accepted-answer merge', () => {

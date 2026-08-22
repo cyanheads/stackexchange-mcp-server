@@ -21,6 +21,10 @@ import { getStackExchangeService } from '@/services/stackexchange/stackexchange-
 
 const mockGetService = vi.mocked(getStackExchangeService);
 
+const mockService = (service: Partial<ReturnType<typeof getStackExchangeService>>): void => {
+  mockGetService.mockReturnValue(service as ReturnType<typeof getStackExchangeService>);
+};
+
 const SITES: NormalizedSite[] = [
   {
     name: 'Stack Overflow',
@@ -60,7 +64,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 describe('stackexchangeListSites handler', () => {
   it('returns all sites when no filter is provided', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     const input = stackexchangeListSites.input.parse({});
     const result = await stackexchangeListSites.handler(input, ctx);
@@ -69,7 +73,7 @@ describe('stackexchangeListSites handler', () => {
   });
 
   it('filters sites by name token (case-insensitive)', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     const input = stackexchangeListSites.input.parse({ filter: 'stack overflow' });
     const result = await stackexchangeListSites.handler(input, ctx);
@@ -78,7 +82,7 @@ describe('stackexchangeListSites handler', () => {
   });
 
   it('filters by api_site_parameter token', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     const input = stackexchangeListSites.input.parse({ filter: 'superuser' });
     const result = await stackexchangeListSites.handler(input, ctx);
@@ -86,7 +90,7 @@ describe('stackexchangeListSites handler', () => {
   });
 
   it('returns empty sites when no sites match the filter', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     const input = stackexchangeListSites.input.parse({ filter: 'xyzzy-does-not-exist' });
     const result = await stackexchangeListSites.handler(input, ctx);
@@ -95,7 +99,7 @@ describe('stackexchangeListSites handler', () => {
   });
 
   it('ignores whitespace-only filter (treated as no filter)', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     const input = stackexchangeListSites.input.parse({ filter: '   ' });
     const result = await stackexchangeListSites.handler(input, ctx);
@@ -104,7 +108,7 @@ describe('stackexchangeListSites handler', () => {
   });
 
   it('matches multi-token filter (all tokens must match)', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     // "server fault" — two tokens, only serverfault matches both
     const input = stackexchangeListSites.input.parse({ filter: 'server fault' });
@@ -114,7 +118,7 @@ describe('stackexchangeListSites handler', () => {
   });
 
   it('returns correct totalCount equal to filtered sites length', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     const input = stackexchangeListSites.input.parse({ filter: 'user' });
     const result = await stackexchangeListSites.handler(input, ctx);
@@ -122,7 +126,7 @@ describe('stackexchangeListSites handler', () => {
   });
 
   it('calls ctx.enrich.notice when filter returns no results', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
     const input = stackexchangeListSites.input.parse({ filter: 'xyzzy-does-not-exist' });
@@ -132,7 +136,7 @@ describe('stackexchangeListSites handler', () => {
   });
 
   it('handles sites with no audience field (sparse)', async () => {
-    mockGetService.mockReturnValue(makeSitesResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeSitesResult());
     const ctx = createMockContext();
     const input = stackexchangeListSites.input.parse({ filter: 'askubuntu' });
     const result = await stackexchangeListSites.handler(input, ctx);

@@ -25,31 +25,42 @@ import { getStackExchangeService } from '@/services/stackexchange/stackexchange-
 
 const mockGetService = vi.mocked(getStackExchangeService);
 
-const makeAnswer = (overrides: Partial<NormalizedAnswer> = {}): NormalizedAnswer => ({
-  answerId: 11227846,
-  score: 34000,
-  isAccepted: true,
-  bodyMarkdown: 'Branch prediction is the answer.',
-  authorName: 'JUser',
-  authorLink: 'https://stackoverflow.com/users/1/juser',
-  authorReputation: 120000,
-  ...overrides,
-});
+const mockService = (service: Partial<ReturnType<typeof getStackExchangeService>>): void => {
+  mockGetService.mockReturnValue(service as ReturnType<typeof getStackExchangeService>);
+};
 
-const makeThread = (overrides: Partial<NormalizedThread> = {}): NormalizedThread => ({
-  questionId: 11227809,
-  title: 'Why is processing a sorted array faster?',
-  link: 'https://stackoverflow.com/questions/11227809',
-  score: 28000,
-  tags: ['java', 'performance'],
-  bodyMarkdown: 'I noticed a **10x** speedup when the array is sorted.',
-  authorName: 'SUser',
-  authorLink: 'https://stackoverflow.com/users/2/suser',
-  acceptedAnswerId: 11227846,
-  answerCount: 1,
-  answers: [makeAnswer()],
-  ...overrides,
-});
+type FixtureOverrides<T> = { [K in keyof T]?: T[K] | undefined };
+
+const withoutUndefined = <T extends object>(value: FixtureOverrides<T>): T =>
+  Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
+
+const makeAnswer = (overrides: FixtureOverrides<NormalizedAnswer> = {}): NormalizedAnswer =>
+  withoutUndefined<NormalizedAnswer>({
+    answerId: 11227846,
+    score: 34000,
+    isAccepted: true,
+    bodyMarkdown: 'Branch prediction is the answer.',
+    authorName: 'JUser',
+    authorLink: 'https://stackoverflow.com/users/1/juser',
+    authorReputation: 120000,
+    ...overrides,
+  });
+
+const makeThread = (overrides: FixtureOverrides<NormalizedThread> = {}): NormalizedThread =>
+  withoutUndefined<NormalizedThread>({
+    questionId: 11227809,
+    title: 'Why is processing a sorted array faster?',
+    link: 'https://stackoverflow.com/questions/11227809',
+    score: 28000,
+    tags: ['java', 'performance'],
+    bodyMarkdown: 'I noticed a **10x** speedup when the array is sorted.',
+    authorName: 'SUser',
+    authorLink: 'https://stackoverflow.com/users/2/suser',
+    acceptedAnswerId: 11227846,
+    answerCount: 1,
+    answers: [makeAnswer()],
+    ...overrides,
+  });
 
 const makeThreadResult = (thread = makeThread()) => ({
   getThread: vi.fn().mockResolvedValue({ thread, quotaRemaining: 250, quotaMax: 300 }),
@@ -64,9 +75,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 describe('stackexchangeGetThread handler', () => {
   it('fetches thread by numeric ID string', async () => {
-    mockGetService.mockReturnValue(
-      makeThreadResult() as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult());
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
     const result = await stackexchangeGetThread.handler(input, ctx);
@@ -75,7 +84,7 @@ describe('stackexchangeGetThread handler', () => {
 
   it('extracts ID from a full Stack Exchange question URL', async () => {
     const svc = makeThreadResult();
-    mockGetService.mockReturnValue(svc as ReturnType<typeof getStackExchangeService>);
+    mockService(svc);
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({
       questionIdOrUrl:
@@ -106,13 +115,13 @@ describe('stackexchangeGetThread handler', () => {
 
   it('throws invalid_id_or_url when service rejects the ID as bad_parameter (out-of-range integer)', async () => {
     const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
-    mockGetService.mockReturnValue({
+    mockService({
       getThread: vi.fn().mockRejectedValue(
         validationError('The question ID is not a valid Stack Exchange question ID.', {
           reason: 'invalid_id_or_url',
         }),
       ),
-    } as ReturnType<typeof getStackExchangeService>);
+    });
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '99999999999' });
     await expect(stackexchangeGetThread.handler(input, ctx)).rejects.toMatchObject({
@@ -122,11 +131,11 @@ describe('stackexchangeGetThread handler', () => {
 
   it('propagates question_not_found when service throws (empty items[])', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
-    mockGetService.mockReturnValue({
+    mockService({
       getThread: vi
         .fn()
         .mockRejectedValue(notFound('Question ID 999 not found', { reason: 'question_not_found' })),
-    } as ReturnType<typeof getStackExchangeService>);
+    });
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '999' });
     await expect(stackexchangeGetThread.handler(input, ctx)).rejects.toMatchObject({
@@ -142,9 +151,7 @@ describe('stackexchangeGetThread handler', () => {
         makeAnswer({ authorName: undefined, authorLink: undefined, authorReputation: undefined }),
       ],
     });
-    mockGetService.mockReturnValue(
-      makeThreadResult(sparseThread) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult(sparseThread));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
     const result = await stackexchangeGetThread.handler(input, ctx);
@@ -154,9 +161,7 @@ describe('stackexchangeGetThread handler', () => {
 
   it('returns thread with no acceptedAnswerId (sparse)', async () => {
     const sparseThread = makeThread({ acceptedAnswerId: undefined });
-    mockGetService.mockReturnValue(
-      makeThreadResult(sparseThread) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult(sparseThread));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
     const result = await stackexchangeGetThread.handler(input, ctx);
@@ -165,9 +170,7 @@ describe('stackexchangeGetThread handler', () => {
 
   it('returns thread with empty answers array', async () => {
     const noAnswers = makeThread({ answers: [] });
-    mockGetService.mockReturnValue(
-      makeThreadResult(noAnswers) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult(noAnswers));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
     const result = await stackexchangeGetThread.handler(input, ctx);
@@ -179,9 +182,7 @@ describe('stackexchangeGetThread handler', () => {
       authorUserId: 1,
       answers: [makeAnswer({ authorUserId: 22656 })],
     });
-    mockGetService.mockReturnValue(
-      makeThreadResult(threadWithIds) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult(threadWithIds));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
     const result = await stackexchangeGetThread.handler(input, ctx);
@@ -194,9 +195,7 @@ describe('stackexchangeGetThread handler', () => {
       authorUserId: undefined,
       answers: [makeAnswer({ authorUserId: undefined })],
     });
-    mockGetService.mockReturnValue(
-      makeThreadResult(sparseThread) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult(sparseThread));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
     const result = await stackexchangeGetThread.handler(input, ctx);
@@ -206,7 +205,7 @@ describe('stackexchangeGetThread handler', () => {
 
   it('passes maxAnswers to service', async () => {
     const svc = makeThreadResult();
-    mockGetService.mockReturnValue(svc as ReturnType<typeof getStackExchangeService>);
+    mockService(svc);
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({
       questionIdOrUrl: '11227809',
@@ -314,9 +313,7 @@ describe('stackexchangeGetThread format', () => {
 describe('stackexchangeGetThread truncation enrichment', () => {
   it('fires truncated when fewer answers are shown than the total answerCount', async () => {
     const thread = makeThread({ answerCount: 27, answers: [makeAnswer()] });
-    mockGetService.mockReturnValue(
-      makeThreadResult(thread) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult(thread));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeGetThread.input.parse({
@@ -329,9 +326,7 @@ describe('stackexchangeGetThread truncation enrichment', () => {
 
   it('omits truncated when every answer is shown (answers.length === answerCount)', async () => {
     const thread = makeThread({ answerCount: 1, answers: [makeAnswer()] });
-    mockGetService.mockReturnValue(
-      makeThreadResult(thread) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult(thread));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
@@ -341,9 +336,7 @@ describe('stackexchangeGetThread truncation enrichment', () => {
 
   it('passes answerCount through the handler unchanged', async () => {
     const thread = makeThread({ answerCount: 27 });
-    mockGetService.mockReturnValue(
-      makeThreadResult(thread) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeThreadResult(thread));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
     const result = await stackexchangeGetThread.handler(input, ctx);

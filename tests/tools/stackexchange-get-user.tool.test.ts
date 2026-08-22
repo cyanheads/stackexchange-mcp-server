@@ -22,22 +22,32 @@ import { getStackExchangeService } from '@/services/stackexchange/stackexchange-
 
 const mockGetService = vi.mocked(getStackExchangeService);
 
-const makeUser = (overrides: Partial<NormalizedUser> = {}): NormalizedUser => ({
-  userId: 1,
-  displayName: 'Jon Skeet',
-  link: 'https://stackoverflow.com/users/1/jon-skeet',
-  reputation: 1400000,
-  badgeCounts: { gold: 860, silver: 9000, bronze: 9500 },
-  location: 'Reading, UK',
-  websiteUrl: 'https://codeblog.jonskeet.uk',
-  answerCount: 38000,
-  questionCount: 7500,
-  topTags: [
-    { tagName: 'c#', answerCount: 22000, answerScore: 300000 },
-    { tagName: 'java', answerCount: 2000, answerScore: 40000 },
-  ],
-  ...overrides,
-});
+const mockService = (service: Partial<ReturnType<typeof getStackExchangeService>>): void => {
+  mockGetService.mockReturnValue(service as ReturnType<typeof getStackExchangeService>);
+};
+
+type FixtureOverrides<T> = { [K in keyof T]?: T[K] | undefined };
+
+const withoutUndefined = <T extends object>(value: FixtureOverrides<T>): T =>
+  Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
+
+const makeUser = (overrides: FixtureOverrides<NormalizedUser> = {}): NormalizedUser =>
+  withoutUndefined<NormalizedUser>({
+    userId: 1,
+    displayName: 'Jon Skeet',
+    link: 'https://stackoverflow.com/users/1/jon-skeet',
+    reputation: 1400000,
+    badgeCounts: { gold: 860, silver: 9000, bronze: 9500 },
+    location: 'Reading, UK',
+    websiteUrl: 'https://codeblog.jonskeet.uk',
+    answerCount: 38000,
+    questionCount: 7500,
+    topTags: [
+      { tagName: 'c#', answerCount: 22000, answerScore: 300000 },
+      { tagName: 'java', answerCount: 2000, answerScore: 40000 },
+    ],
+    ...overrides,
+  });
 
 const makeUserResult = (user = makeUser()) => ({
   getUser: vi.fn().mockResolvedValue({ user, quotaRemaining: 250, quotaMax: 300 }),
@@ -52,7 +62,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 describe('stackexchangeGetUser handler', () => {
   it('returns user for a valid user ID', async () => {
-    mockGetService.mockReturnValue(makeUserResult() as ReturnType<typeof getStackExchangeService>);
+    mockService(makeUserResult());
     const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
     const input = stackexchangeGetUser.input.parse({ userId: 1 });
     const result = await stackexchangeGetUser.handler(input, ctx);
@@ -63,7 +73,7 @@ describe('stackexchangeGetUser handler', () => {
 
   it('defaults site to stackoverflow', async () => {
     const svc = makeUserResult();
-    mockGetService.mockReturnValue(svc as ReturnType<typeof getStackExchangeService>);
+    mockService(svc);
     const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
     const input = stackexchangeGetUser.input.parse({ userId: 1 });
     await stackexchangeGetUser.handler(input, ctx);
@@ -75,11 +85,11 @@ describe('stackexchangeGetUser handler', () => {
 
   it('throws user_not_found when service throws (empty items[])', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
-    mockGetService.mockReturnValue({
+    mockService({
       getUser: vi
         .fn()
         .mockRejectedValue(notFound('User ID 999999 not found', { reason: 'user_not_found' })),
-    } as ReturnType<typeof getStackExchangeService>);
+    });
     const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
     const input = stackexchangeGetUser.input.parse({ userId: 999999 });
     await expect(stackexchangeGetUser.handler(input, ctx)).rejects.toMatchObject({
@@ -96,9 +106,7 @@ describe('stackexchangeGetUser handler', () => {
       questionCount: undefined,
       topTags: [],
     });
-    mockGetService.mockReturnValue(
-      makeUserResult(sparseUser) as ReturnType<typeof getStackExchangeService>,
-    );
+    mockService(makeUserResult(sparseUser));
     const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
     const input = stackexchangeGetUser.input.parse({ userId: 42 });
     const result = await stackexchangeGetUser.handler(input, ctx);
@@ -109,7 +117,7 @@ describe('stackexchangeGetUser handler', () => {
 
   it('passes custom site to service', async () => {
     const svc = makeUserResult();
-    mockGetService.mockReturnValue(svc as ReturnType<typeof getStackExchangeService>);
+    mockService(svc);
     const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
     const input = stackexchangeGetUser.input.parse({ userId: 1, site: 'superuser' });
     await stackexchangeGetUser.handler(input, ctx);

@@ -19,16 +19,26 @@ import { getStackExchangeService } from '@/services/stackexchange/stackexchange-
 
 const mockGetService = vi.mocked(getStackExchangeService);
 
-const makeQuestion = (overrides: Partial<NormalizedQuestion> = {}): NormalizedQuestion => ({
-  questionId: 11227809,
-  title: 'Why is processing a sorted array faster than processing an unsorted array?',
-  link: 'https://stackoverflow.com/questions/11227809',
-  score: 28000,
-  answerCount: 27,
-  isAnswered: true,
-  tags: ['java', 'c++', 'performance', 'sorting'],
-  ...overrides,
-});
+const mockService = (service: Partial<ReturnType<typeof getStackExchangeService>>): void => {
+  mockGetService.mockReturnValue(service as ReturnType<typeof getStackExchangeService>);
+};
+
+type FixtureOverrides<T> = { [K in keyof T]?: T[K] | undefined };
+
+const withoutUndefined = <T extends object>(value: FixtureOverrides<T>): T =>
+  Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
+
+const makeQuestion = (overrides: FixtureOverrides<NormalizedQuestion> = {}): NormalizedQuestion =>
+  withoutUndefined<NormalizedQuestion>({
+    questionId: 11227809,
+    title: 'Why is processing a sorted array faster than processing an unsorted array?',
+    link: 'https://stackoverflow.com/questions/11227809',
+    score: 28000,
+    answerCount: 27,
+    isAnswered: true,
+    tags: ['java', 'c++', 'performance', 'sorting'],
+    ...overrides,
+  });
 
 const makeSearchResult = (questions: NormalizedQuestion[] = [makeQuestion()], hasMore = false) => ({
   searchQuestions: vi.fn().mockResolvedValue({
@@ -48,10 +58,8 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 describe('stackexchangeSearchQuestions handler', () => {
   it('returns questions for a valid query', async () => {
-    mockGetService.mockReturnValue(
-      makeSearchResult() as ReturnType<typeof getStackExchangeService>,
-    );
-    const ctx = createMockContext();
+    mockService(makeSearchResult());
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const input = stackexchangeSearchQuestions.input.parse({ query: 'sorted array faster' });
     const result = await stackexchangeSearchQuestions.handler(input, ctx);
     expect(result.questions).toHaveLength(1);
@@ -61,8 +69,8 @@ describe('stackexchangeSearchQuestions handler', () => {
 
   it('applies default site=stackoverflow and sort=relevance', async () => {
     const mockSvc = makeSearchResult();
-    mockGetService.mockReturnValue(mockSvc as ReturnType<typeof getStackExchangeService>);
-    const ctx = createMockContext();
+    mockService(mockSvc);
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const input = stackexchangeSearchQuestions.input.parse({ query: 'test query' });
     await stackexchangeSearchQuestions.handler(input, ctx);
     expect(mockSvc.searchQuestions).toHaveBeenCalledWith(
@@ -73,8 +81,8 @@ describe('stackexchangeSearchQuestions handler', () => {
 
   it('passes tags when provided', async () => {
     const mockSvc = makeSearchResult();
-    mockGetService.mockReturnValue(mockSvc as ReturnType<typeof getStackExchangeService>);
-    const ctx = createMockContext();
+    mockService(mockSvc);
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const input = stackexchangeSearchQuestions.input.parse({
       query: 'async await',
       tags: ['javascript', 'node.js'],
@@ -88,8 +96,8 @@ describe('stackexchangeSearchQuestions handler', () => {
 
   it('strips empty-string tags (form-client payload)', async () => {
     const mockSvc = makeSearchResult();
-    mockGetService.mockReturnValue(mockSvc as ReturnType<typeof getStackExchangeService>);
-    const ctx = createMockContext();
+    mockService(mockSvc);
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const input = stackexchangeSearchQuestions.input.parse({
       query: 'test',
       tags: ['', ''],
@@ -102,10 +110,8 @@ describe('stackexchangeSearchQuestions handler', () => {
   });
 
   it('returns empty array when API returns no results (HTTP 200 with items=[])', async () => {
-    mockGetService.mockReturnValue(
-      makeSearchResult([]) as ReturnType<typeof getStackExchangeService>,
-    );
-    const ctx = createMockContext();
+    mockService(makeSearchResult([]));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const input = stackexchangeSearchQuestions.input.parse({
       query: 'xyzzy-does-not-exist-1234567',
     });
@@ -115,7 +121,7 @@ describe('stackexchangeSearchQuestions handler', () => {
 
   it('passes minScore and acceptedOnly when provided', async () => {
     const mockSvc = makeSearchResult();
-    mockGetService.mockReturnValue(mockSvc as ReturnType<typeof getStackExchangeService>);
+    mockService(mockSvc);
     const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const input = stackexchangeSearchQuestions.input.parse({
       query: 'test',
@@ -131,13 +137,13 @@ describe('stackexchangeSearchQuestions handler', () => {
 
   it('propagates service errors (e.g. invalid_site → throws)', async () => {
     const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
-    mockGetService.mockReturnValue({
+    mockService({
       searchQuestions: vi
         .fn()
         .mockRejectedValue(
           validationError('bad_parameter: invalid site', { reason: 'invalid_site' }),
         ),
-    } as ReturnType<typeof getStackExchangeService>);
+    });
     const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const input = stackexchangeSearchQuestions.input.parse({
       query: 'test',
@@ -216,10 +222,8 @@ describe('stackexchangeSearchQuestions truncation enrichment', () => {
     Array.from({ length: 5 }, (_, i) => makeQuestion({ questionId: 1000 + i }));
 
   it('fires truncated when the page is filled and the upstream has more', async () => {
-    mockGetService.mockReturnValue(
-      makeSearchResult(fullPage(), true) as ReturnType<typeof getStackExchangeService>,
-    );
-    const ctx = createMockContext();
+    mockService(makeSearchResult(fullPage(), true));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5 });
     await stackexchangeSearchQuestions.handler(input, ctx);
@@ -227,10 +231,8 @@ describe('stackexchangeSearchQuestions truncation enrichment', () => {
   });
 
   it('omits truncated when the page is filled but the upstream has no more', async () => {
-    mockGetService.mockReturnValue(
-      makeSearchResult(fullPage(), false) as ReturnType<typeof getStackExchangeService>,
-    );
-    const ctx = createMockContext();
+    mockService(makeSearchResult(fullPage(), false));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5 });
     await stackexchangeSearchQuestions.handler(input, ctx);
@@ -238,10 +240,8 @@ describe('stackexchangeSearchQuestions truncation enrichment', () => {
   });
 
   it('omits truncated when fewer results than the page cap are returned', async () => {
-    mockGetService.mockReturnValue(
-      makeSearchResult([makeQuestion()], true) as ReturnType<typeof getStackExchangeService>,
-    );
-    const ctx = createMockContext();
+    mockService(makeSearchResult([makeQuestion()], true));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5 });
     await stackexchangeSearchQuestions.handler(input, ctx);

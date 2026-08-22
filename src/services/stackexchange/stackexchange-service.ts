@@ -7,14 +7,14 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
+  McpError,
   notFound,
   rateLimited,
   serviceUnavailable,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
-import { withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { decodeHtmlEntities, normalizeHtml } from './html-normalizer.js';
 import type {
   SeAnswer,
@@ -27,6 +27,7 @@ import type {
 } from './types.js';
 
 const BASE_URL = 'https://api.stackexchange.com/2.3';
+const REQUEST_TIMEOUT_MS = 30_000;
 
 /** Module-level backoff tracking — per-process, acceptable for server-side use. */
 let backoffUntil = 0;
@@ -175,42 +176,48 @@ export class StackExchangeService {
   private async fetchSe<T>(url: string, ctx: Context): Promise<SeWrapper<T>> {
     await waitForBackoff();
 
-    const response = await fetch(url, {
-      headers: {
-        'Accept-Encoding': 'gzip',
-        Accept: 'application/json',
-      },
-      signal: ctx.signal,
-    });
+    let response: Response;
+    try {
+      response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, ctx, {
+        headers: {
+          'Accept-Encoding': 'gzip',
+          Accept: 'application/json',
+        },
+        signal: ctx.signal,
+        expectedStatuses: [400],
+      });
+    } catch (error) {
+      // SE returns HTTP 400 with a JSON error envelope for bad parameters.
+      if (
+        error instanceof McpError &&
+        error.data?.status === 400 &&
+        typeof error.data.body === 'string'
+      ) {
+        let errObj: SeError | undefined;
+        try {
+          errObj = JSON.parse(error.data.body) as SeError;
+        } catch {
+          // Preserve the framework-classified HTTP error when the body is not JSON.
+        }
+        if (errObj?.error_name === 'bad_parameter') {
+          // SE returns error_message "ids" when the IDs field is rejected (e.g. out-of-range integer).
+          // All other bad_parameter responses (site, tags, etc.) map to invalid_site.
+          const reason = errObj.error_message === 'ids' ? 'invalid_id_or_url' : 'invalid_site';
+          const message =
+            reason === 'invalid_id_or_url'
+              ? 'The question ID is not a valid Stack Exchange question ID.'
+              : `Stack Exchange API error: ${errObj.error_message}`;
+          throw validationError(message, {
+            reason,
+            error_name: errObj.error_name,
+            error_id: errObj.error_id,
+          });
+        }
+      }
+      throw error;
+    }
 
     const text = await response.text();
-
-    // SE returns HTTP 400 with JSON error envelope for bad params
-    if (!response.ok) {
-      let errObj: SeError | undefined;
-      try {
-        errObj = JSON.parse(text) as SeError;
-      } catch {
-        // ignore parse failure
-      }
-      if (errObj?.error_name === 'bad_parameter') {
-        // SE returns error_message "ids" when the IDs field is rejected (e.g. out-of-range integer).
-        // All other bad_parameter responses (site, tags, etc.) map to invalid_site.
-        const reason = errObj.error_message === 'ids' ? 'invalid_id_or_url' : 'invalid_site';
-        const message =
-          reason === 'invalid_id_or_url'
-            ? `The question ID is not a valid Stack Exchange question ID.`
-            : `Stack Exchange API error: ${errObj.error_message}`;
-        throw validationError(message, {
-          reason,
-          error_name: errObj.error_name,
-          error_id: errObj.error_id,
-        });
-      }
-      throw serviceUnavailable(`Stack Exchange API returned HTTP ${response.status}`, {
-        status: response.status,
-      });
-    }
 
     let wrapper: SeWrapper<T>;
     try {
@@ -304,7 +311,7 @@ export class StackExchangeService {
       },
       {
         operation: 'searchQuestions',
-        context: ctx as unknown as RequestContextLike,
+        context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
       },
@@ -421,7 +428,7 @@ export class StackExchangeService {
       },
       {
         operation: 'getThread',
-        context: ctx as unknown as RequestContextLike,
+        context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
       },
@@ -473,7 +480,7 @@ export class StackExchangeService {
       },
       {
         operation: 'getTagFaq',
-        context: ctx as unknown as RequestContextLike,
+        context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
       },
@@ -545,7 +552,7 @@ export class StackExchangeService {
       },
       {
         operation: 'getUser',
-        context: ctx as unknown as RequestContextLike,
+        context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
       },
@@ -584,7 +591,7 @@ export class StackExchangeService {
       },
       {
         operation: 'getSites',
-        context: ctx as unknown as RequestContextLike,
+        context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
       },
