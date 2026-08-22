@@ -1,10 +1,9 @@
 # stackexchange-mcp-server - Directory Structure
 
-Generated on: 2026-07-17 00:17:12
+Generated on: 2026-08-22 21:19:15
 
 ```text
 stackexchange-mcp-server/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -15,6 +14,8 @@ stackexchange-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
