@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-08-22
+
+MCP SDK v2 adds 2026-07-28 client support and strict inputs; Stack Exchange requests now have a 30-second whole-exchange timeout
+
 ## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-07-16
 
 search_questions, get_tag_faq, and get_thread now flag truncated only on genuine capping; get_thread also merges in an out-of-page accepted answer and surfaces answerCount (#7, #11)
