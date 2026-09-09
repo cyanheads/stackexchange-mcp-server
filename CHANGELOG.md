@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-09-09
+
+HTML→markdown normalizer rewritten to stop losing escaped brackets, doubled entities, linked bold/italic text, and table/image content
+
 ## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-08-22
 
 MCP SDK v2 adds 2026-07-28 client support and strict inputs; Stack Exchange requests now have a 30-second whole-exchange timeout
