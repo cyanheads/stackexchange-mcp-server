@@ -114,6 +114,58 @@ describe('StackExchangeService entity decoding', () => {
   });
 });
 
+describe('StackExchangeService body normalization', () => {
+  it('normalizes table, nested list, and escaped-bracket bodies into structuredContent markdown', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input).includes('/answers')) {
+        return jsonResponse({
+          items: [
+            {
+              answer_id: 2,
+              question_id: 1,
+              score: 10,
+              is_accepted: true,
+              body: '<div class="s-table-container"><table class="s-table"><thead><tr><th>Method</th><th>Time</th></tr></thead><tbody><tr><td>sorted</td><td>1.93s</td></tr></tbody></table></div>',
+            },
+          ],
+          has_more: false,
+          quota_remaining: 100,
+          quota_max: 300,
+        });
+      }
+      return jsonResponse({
+        items: [
+          {
+            question_id: 1,
+            title: 'Why use a &lt;div&gt;?',
+            link: 'https://stackoverflow.com/q/1',
+            score: 5,
+            answer_count: 1,
+            is_answered: true,
+            tags: ['html'],
+            body: '<p>Use the &lt;div&gt; element.</p><ul><li>outer<ul><li>inner</li></ul></li></ul>',
+          },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      });
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: 1 },
+      createMockContext(),
+    );
+
+    expect(thread.title).toBe('Why use a <div>?');
+    expect(thread.bodyMarkdown).toContain('Use the <div> element.');
+    expect(thread.bodyMarkdown).toContain('- outer\n  - inner');
+    expect(thread.answers[0]?.bodyMarkdown).toBe(
+      '| Method | Time |\n| --- | --- |\n| sorted | 1.93s |',
+    );
+  });
+});
+
 describe('StackExchangeService.searchQuestions sort/min mapping', () => {
   /** A 200 OK /search/advanced wrapper with no items and non-zero quota. */
   const searchWrapper = { items: [], has_more: false, quota_remaining: 100, quota_max: 300 };

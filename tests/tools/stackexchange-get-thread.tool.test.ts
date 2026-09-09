@@ -9,6 +9,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { stackexchangeGetThread } from '@/mcp-server/tools/definitions/stackexchange-get-thread.tool.js';
+import { normalizeHtml } from '@/services/stackexchange/html-normalizer.js';
 import type {
   NormalizedAnswer,
   NormalizedThread,
@@ -349,5 +350,29 @@ describe('stackexchangeGetThread format answerCount', () => {
     const thread = makeThread({ answerCount: 999 });
     const text = (stackexchangeGetThread.format!(thread)[0] as { text: string }).text;
     expect(text).toContain('999');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Normalized bodies reach content[] as well as structuredContent
+// ---------------------------------------------------------------------------
+describe('stackexchangeGetThread format of normalized bodies', () => {
+  it('renders a table, a nested list, and literal angle brackets in the rendered text', () => {
+    const thread = makeThread({
+      bodyMarkdown: normalizeHtml(
+        '<p>Use the &lt;div&gt; element.</p><ul><li>outer<ul><li>inner</li></ul></li></ul>',
+      ),
+      answers: [
+        makeAnswer({
+          bodyMarkdown: normalizeHtml(
+            '<div class="s-table-container"><table class="s-table"><thead><tr><th>Method</th><th>Time</th></tr></thead><tbody><tr><td>sorted</td><td>1.93s</td></tr></tbody></table></div>',
+          ),
+        }),
+      ],
+    });
+    const text = (stackexchangeGetThread.format!(thread)[0] as { text: string }).text;
+    expect(text).toContain('Use the <div> element.');
+    expect(text).toContain('- outer\n  - inner');
+    expect(text).toContain('| Method | Time |\n| --- | --- |\n| sorted | 1.93s |');
   });
 });

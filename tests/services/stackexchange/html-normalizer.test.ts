@@ -272,4 +272,247 @@ describe('normalizeHtml', () => {
       expect(result).toContain('This preserves insertion order.');
     });
   });
+
+  describe('characterization of the supported tag set', () => {
+    it('renders a blockquote wrapping a list as quoted bullets', () => {
+      expect(normalizeHtml('<blockquote><ul><li>alpha</li><li>beta</li></ul></blockquote>')).toBe(
+        '> - alpha\n> - beta',
+      );
+    });
+
+    it('converts every inline mark inside one paragraph', () => {
+      const html =
+        '<p>See <strong>this</strong> and <em>that</em> at <a href="https://e.com">e</a>.</p>';
+      expect(normalizeHtml(html)).toBe('See **this** and _that_ at [e](https://e.com).');
+    });
+
+    it('numbers ordered items sequentially and bullets unordered ones', () => {
+      expect(normalizeHtml('<ol><li>Alpha</li><li>Beta</li></ol>')).toBe('1. Alpha\n2. Beta');
+      expect(normalizeHtml('<ul><li>First</li><li>Second</li></ul>')).toBe('- First\n- Second');
+    });
+
+    it('drops an unknown self-closing tag and keeps the surrounding text', () => {
+      expect(normalizeHtml('a <wbr/> b')).toBe('a  b');
+    });
+
+    it('leaves an unrecognized entity reference encoded', () => {
+      expect(decodeHtmlEntities('&notanentity; stays')).toBe('&notanentity; stays');
+    });
+
+    it('decodes a mixed entity run in a plain-text field', () => {
+      expect(decodeHtmlEntities('AT&amp;T &lt;tag&gt; &quot;q&quot;')).toBe('AT&T <tag> "q"');
+    });
+  });
+
+  describe('escaped angle brackets survive every wrapper (#13)', () => {
+    it('survives inside a paragraph', () => {
+      expect(normalizeHtml('<p>Use the &lt;div&gt; element instead of &lt;span&gt;.</p>')).toBe(
+        'Use the <div> element instead of <span>.',
+      );
+    });
+
+    it('survives a bare comparison inside a paragraph', () => {
+      expect(normalizeHtml('<p>Check whether a &lt; b and b &gt; c.</p>')).toBe(
+        'Check whether a < b and b > c.',
+      );
+    });
+
+    it('survives inside a list item', () => {
+      expect(normalizeHtml('<ul><li>Wrap it in &lt;pre&gt; tags</li></ul>')).toBe(
+        '- Wrap it in <pre> tags',
+      );
+    });
+
+    it('survives inside a blockquote', () => {
+      const html = '<blockquote><p>Declare it as List&lt;String&gt; myList.</p></blockquote>';
+      expect(normalizeHtml(html)).toBe('> Declare it as List<String> myList.');
+    });
+
+    it('survives inside inline code', () => {
+      expect(normalizeHtml('<p>Use <code>&lt;div&gt;</code> here.</p>')).toBe('Use `<div>` here.');
+    });
+
+    it('round-trips a post alternating prose with entity-heavy code fences', () => {
+      const html = [
+        '<p>I need to match all of these opening tags:</p>',
+        '<pre><code>&lt;p&gt;\n&lt;a href=&quot;foo&quot;&gt;\n</code></pre>',
+        '<p>But not self-closing tags:</p>',
+        '<pre><code>&lt;br /&gt;\n&lt;hr class=&quot;foo&quot; /&gt;\n</code></pre>',
+      ].join('');
+      const result = normalizeHtml(html);
+      expect(result).toContain('<p>');
+      expect(result).toContain('<a href="foo">');
+      expect(result).toContain('But not self-closing tags:');
+      expect(result).toContain('<br />');
+      expect(result).toContain('<hr class="foo" />');
+    });
+  });
+
+  describe('tables, media, and inline semantics (#14)', () => {
+    it('renders the real SE table shape as a markdown table', () => {
+      const html =
+        '<div class="s-table-container"><table class="s-table"><thead><tr><th>Method</th><th>Time</th></tr></thead><tbody><tr><td>sorted</td><td>1.93s</td></tr></tbody></table></div>';
+      expect(normalizeHtml(html)).toBe('| Method | Time |\n| --- | --- |\n| sorted | 1.93s |');
+    });
+
+    it('separates cells without inventing a header row when the table has no th', () => {
+      const html = '<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>';
+      const result = normalizeHtml(html);
+      expect(result).toBe('| a | b |\n| c | d |');
+      expect(result).not.toContain('---');
+    });
+
+    it('escapes a pipe inside a cell so it cannot split the row', () => {
+      const html = '<table><tr><th>op</th></tr><tr><td>a | b</td></tr></table>';
+      expect(normalizeHtml(html)).toBe('| op |\n| --- |\n| a \\| b |');
+    });
+
+    it('converts a bare image to markdown image syntax', () => {
+      expect(normalizeHtml('<img src="https://i.sstatic.net/xyz.png" alt="chart">')).toBe(
+        '![chart](https://i.sstatic.net/xyz.png)',
+      );
+    });
+
+    it('keeps both the link and the image for an anchor-wrapped image', () => {
+      const html =
+        '<a href="https://i.sstatic.net/abc.png"><img src="https://i.sstatic.net/abc.png" alt="architecture diagram"></a>';
+      expect(normalizeHtml(html)).toBe(
+        '[![architecture diagram](https://i.sstatic.net/abc.png)](https://i.sstatic.net/abc.png)',
+      );
+    });
+
+    it('renders sup and sub distinguishably from the surrounding text', () => {
+      expect(normalizeHtml('<p>x<sup>2</sup> and H<sub>2</sub>O</p>')).toBe('x^2 and H_2O');
+    });
+
+    it('renders del and s as strikethrough', () => {
+      expect(normalizeHtml('<p><del>old</del> new</p>')).toBe('~~old~~ new');
+      expect(normalizeHtml('<p><s>gone</s> here</p>')).toBe('~~gone~~ here');
+    });
+
+    it('renders kbd as inline code', () => {
+      expect(normalizeHtml('<p>Press <kbd>Ctrl</kbd>+<kbd>C</kbd></p>')).toBe('Press `Ctrl`+`C`');
+    });
+
+    it('renders hr as a rule on its own line', () => {
+      expect(normalizeHtml('<p>above</p><hr><p>below</p>')).toBe('above\n\n---\n\nbelow');
+    });
+
+    it('indents a nested list under its parent item', () => {
+      const html = '<ul><li>outer<ul><li>inner a</li><li>inner b</li></ul></li></ul>';
+      expect(normalizeHtml(html)).toBe('- outer\n  - inner a\n  - inner b');
+    });
+
+    it('indents three levels, mixing ordered and unordered', () => {
+      const html =
+        '<ul><li>one<ol><li>two<ul><li>three</li></ul></li></ol></li><li>sibling</li></ul>';
+      expect(normalizeHtml(html)).toBe('- one\n  1. two\n    - three\n- sibling');
+    });
+
+    it('nests blockquote levels rather than flattening them', () => {
+      const html = '<blockquote><p>outer</p><blockquote><p>inner</p></blockquote></blockquote>';
+      expect(normalizeHtml(html)).toBe('> outer\n> \n> > inner');
+    });
+  });
+
+  describe('entities decode exactly once (#22)', () => {
+    it('yields a literal &lt;div&gt; from a double-escaped tag', () => {
+      expect(normalizeHtml('<p>Write &amp;lt;div&amp;gt; to show a literal tag.</p>')).toBe(
+        'Write &lt;div&gt; to show a literal tag.',
+      );
+    });
+
+    it('yields a literal numeric reference from a double-escaped one', () => {
+      expect(normalizeHtml('<p>The literal text &amp;#39; is an escaped apostrophe.</p>')).toBe(
+        'The literal text &#39; is an escaped apostrophe.',
+      );
+      expect(normalizeHtml('<p>Use &amp;#x27; in HTML.</p>')).toBe('Use &#x27; in HTML.');
+    });
+
+    it('decodes once inside a code fence too', () => {
+      expect(normalizeHtml('<pre><code>&amp;lt;div&amp;gt;</code></pre>')).toBe(
+        '```\n&lt;div&gt;\n```',
+      );
+    });
+
+    it('decodes once through the exported plain-text helper', () => {
+      expect(decodeHtmlEntities('&amp;lt;')).toBe('&lt;');
+      expect(decodeHtmlEntities('&amp;amp;')).toBe('&amp;');
+    });
+
+    it('still decodes an ordinary single-escaped entity', () => {
+      expect(normalizeHtml('<p>Tom &amp; Jerry</p>')).toBe('Tom & Jerry');
+      expect(decodeHtmlEntities('a &lt; b')).toBe('a < b');
+    });
+  });
+
+  describe('links nested inside emphasis (#23)', () => {
+    it('keeps the href of a link wrapped in <strong>', () => {
+      expect(
+        normalizeHtml('<p><strong><a href="https://ex.com/a">docs</a></strong> first.</p>'),
+      ).toBe('**[docs](https://ex.com/a)** first.');
+    });
+
+    it('keeps the href of a link wrapped in <b>', () => {
+      expect(normalizeHtml('<p><b><a href="https://ex.com/b">docs</a></b></p>')).toBe(
+        '**[docs](https://ex.com/b)**',
+      );
+    });
+
+    it('keeps the href of a link wrapped in <em>', () => {
+      expect(normalizeHtml('<p><em><a href="https://ex.com/c">spec</a></em> second.</p>')).toBe(
+        '_[spec](https://ex.com/c)_ second.',
+      );
+    });
+
+    it('keeps the href of a link wrapped in <i>', () => {
+      expect(normalizeHtml('<p><i><a href="https://ex.com/d">spec</a></i></p>')).toBe(
+        '_[spec](https://ex.com/d)_',
+      );
+    });
+
+    it('leaves the already-correct link-outside-emphasis nesting unchanged', () => {
+      expect(
+        normalizeHtml('<p><a href="https://ex.com/e"><strong>docs</strong></a> third.</p>'),
+      ).toBe('[**docs**](https://ex.com/e) third.');
+    });
+
+    it('keeps inline code and images inside emphasis', () => {
+      expect(normalizeHtml('<p><strong><code>flag</code></strong></p>')).toBe('**`flag`**');
+      expect(normalizeHtml('<p><em><img src="https://ex.com/i.png" alt="chart"></em></p>')).toBe(
+        '_![chart](https://ex.com/i.png)_',
+      );
+    });
+  });
+
+  describe('numeric entity boundaries', () => {
+    it('maps a surrogate code point to the replacement character', () => {
+      expect(normalizeHtml('&#xD800;')).toBe('�');
+      expect(normalizeHtml('&#55296;')).toBe('�');
+    });
+
+    it('decodes a non-BMP entity inside a code fence', () => {
+      expect(normalizeHtml('<pre><code>emoji &#128105; here</code></pre>')).toBe(
+        '```\nemoji 👩 here\n```',
+      );
+    });
+  });
+
+  describe('malformed and empty inputs', () => {
+    it('keeps item text when a list is never closed', () => {
+      expect(normalizeHtml('<ul><li>orphan')).toBe('orphan');
+    });
+
+    it('keeps quoted text when a blockquote is never closed', () => {
+      expect(normalizeHtml('<blockquote>orphan')).toBe('orphan');
+    });
+
+    it('drops an empty table rather than emitting an empty row', () => {
+      expect(normalizeHtml('<table></table>')).toBe('');
+    });
+
+    it('drops an image that carries no src', () => {
+      expect(normalizeHtml('<p><img alt="nothing to link">text</p>')).toBe('text');
+    });
+  });
 });
