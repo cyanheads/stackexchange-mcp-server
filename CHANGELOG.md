@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-09-09
+
+Reference-style links, definition lines, and blockquote markers no longer survive into search excerpts as literal text
+
 ## [0.1.13](changelog/0.1.x/0.1.13.md) — 2026-09-09
 
 Search excerpts, result paging, opt-in thread comments, and declared error contracts for site listing and unrecognized API keys
