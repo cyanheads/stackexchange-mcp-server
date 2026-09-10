@@ -1,6 +1,6 @@
 # stackexchange-mcp-server - Directory Structure
 
-Generated on: 2026-09-09 22:50:16
+Generated on: 2026-09-10 01:46:55
 
 ```text
 stackexchange-mcp-server/
@@ -160,6 +160,7 @@ stackexchange-mcp-server/
 │   │       ├── html-normalizer.test.ts
 │   │       └── stackexchange-service.test.ts
 │   └── tools/
+│       ├── error-contract.wire.test.ts
 │       ├── stackexchange-get-tag-faq.tool.test.ts
 │       ├── stackexchange-get-thread.tool.test.ts
 │       ├── stackexchange-get-user.tool.test.ts

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-09-09
+
+Full site pagination, wired recovery hints, populated user counts, and post dates across search, thread, tag-FAQ, and user outputs
+
 ## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-09-09
 
 HTML→markdown normalizer rewritten to stop losing escaped brackets, doubled entities, linked bold/italic text, and table/image content
