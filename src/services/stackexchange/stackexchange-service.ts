@@ -116,6 +116,63 @@ const INDENTED_CODE_LINE = /^(?: {4}|\t).*$/gm;
 /** A markdown link whose closing `)` the cut removed — `[text](https://exa`. */
 const UNCLOSED_LINK = /^\[[^\]]*\]\([^)]*$/;
 
+/**
+ * A leading blockquote marker, nested levels included — `>`, `> > `. Structure
+ * rather than prose, and stray punctuation once the lines collapse onto one.
+ */
+const BLOCKQUOTE_MARKER = /^ {0,3}(?:> ?)+/gm;
+
+/**
+ * A link reference definition line — `[label]: https://example.com "Title"`.
+ *
+ * Follows CommonMark's single-line form: up to three leading spaces, a
+ * destination, and nothing after it but an optional quoted or parenthesized
+ * title. The tail anchor is what keeps ordinary prose that opens with a
+ * bracketed word (`[Note]: this only happens on startup`) from reading as a
+ * definition and being deleted.
+ *
+ * Serves both halves of the fix — it collects the labels a body defines, and it
+ * drops the definition lines themselves, which the four-space code stripping
+ * misses because a definition block is conventionally indented two.
+ */
+const REFERENCE_DEFINITION_LINE =
+  /^ {0,3}\[([^[\]]+)\]:[ \t]*(?:<[^<>\n]*>|\S+)(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*$/gm;
+
+/**
+ * A reference-style link or image — `[text][label]`, the shorthand `[text][]`,
+ * and `![alt][label]`. Neither bracket may contain a bracket, so chained
+ * subscripting matches the shape one pair at a time instead of swallowing its
+ * neighbours. Whether the match is a link at all is decided by the definition
+ * lookup, never by the shape.
+ */
+const REFERENCE_LINK = /!?\[([^[\]]*)\]\[([^[\]]*)\]/g;
+
+/** Match a reference label the way CommonMark does: case-folded, inner whitespace collapsed. */
+function normalizeLabel(label: string): string {
+  return label.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/**
+ * Flatten reference-style links to their text, but only where the body actually
+ * defines the label.
+ *
+ * `[text][label]` is link syntax only when a matching definition exists. The
+ * same bracket shape is ordinary prose across real question bodies — chained
+ * subscripting (`grid[i][j]`), driver error prefixes (`[Microsoft][SQL
+ * Server]`), adjacent tag mentions (`[c++][java]`) — and a pattern-only flatten
+ * deletes that content rather than repairing broken markup, so an unresolved
+ * pair is left exactly as written.
+ */
+function flattenReferenceLinks(text: string, definedLabels: ReadonlySet<string>): string {
+  if (definedLabels.size === 0) return text;
+  return text.replace(REFERENCE_LINK, (whole, linkText: string, label: string) => {
+    // The shorthand `[text][]` carries its label in the text.
+    const key = normalizeLabel(label) || normalizeLabel(linkText);
+    // The `!` sits outside both captures, so a resolved image leaves alt text alone.
+    return definedLabels.has(key) ? linkText : whole;
+  });
+}
+
 /** Convert SE's Unix epoch seconds to an ISO 8601 string. */
 function toIsoDate(epochSeconds: number): string {
   return new Date(epochSeconds * 1000).toISOString();
@@ -147,18 +204,33 @@ function trimDanglingMarkdown(text: string): string {
  *
  * Entities are decoded first: `body_markdown` arrives HTML-encoded (`&quot;`,
  * `&#39;`) the way `title` does, and cutting before decoding can split an entity
- * into `&qu`. Code blocks come out rather than being truncated into — a clipped
- * fence dangles, and a flattened code block is noise in a one-paragraph excerpt.
- * Returns undefined when nothing but code and whitespace was there, so a caller
- * gets no excerpt rather than a fabricated one.
+ * into `&qu`. Blockquote markers go next, while the lines are still lines. Code
+ * blocks come out rather than being truncated into — a clipped fence dangles,
+ * and a flattened code block is noise in a one-paragraph excerpt. Returns
+ * undefined when nothing but code and whitespace was there, so a caller gets no
+ * excerpt rather than a fabricated one.
+ *
+ * Reference definitions are read from the whole body and their lines dropped,
+ * then resolvable reference links are flattened before the cut — so a label
+ * defined far below the excerpt window still resolves the link above it, and a
+ * link spanning the boundary is plain words by the time the cut lands.
  */
 function deriveExcerpt(bodyMarkdown: string): string | undefined {
-  const prose = decodeHtmlEntities(bodyMarkdown)
+  const withoutCode = decodeHtmlEntities(bodyMarkdown)
+    .replace(BLOCKQUOTE_MARKER, '')
     .replace(FENCED_CODE_BLOCK, ' ')
     .replace(TRAILING_FENCE, ' ')
-    .replace(INDENTED_CODE_LINE, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(INDENTED_CODE_LINE, ' ');
+
+  const definedLabels = new Set<string>();
+  for (const [, label] of withoutCode.matchAll(REFERENCE_DEFINITION_LINE)) {
+    if (label !== undefined) definedLabels.add(normalizeLabel(label));
+  }
+
+  const prose = flattenReferenceLinks(
+    withoutCode.replace(REFERENCE_DEFINITION_LINE, ' ').replace(/\s+/g, ' ').trim(),
+    definedLabels,
+  );
 
   if (!prose) return undefined;
   if (prose.length <= EXCERPT_MAX_CHARS) return prose;

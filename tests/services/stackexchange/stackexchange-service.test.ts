@@ -1828,6 +1828,159 @@ describe('StackExchangeService excerpt derivation', () => {
     expect(questions[0]?.excerpt).toBeUndefined();
     expect(questions[0]?.title).toBe('A question');
   });
+
+  // -------------------------------------------------------------------------
+  // #26 — reference-style links, definition lines, and blockquote markers
+  // -------------------------------------------------------------------------
+
+  /** Filler long enough to push whatever follows it past the excerpt window. */
+  const PADDING = 'padding word '.repeat(22);
+
+  // -- characterization: neighbouring bracket handling, unchanged by the fix --
+
+  it('leaves an inline link intact — it carries its own destination', async () => {
+    expect(await excerptFor('See [the docs](https://example.com/a) for details.')).toBe(
+      'See [the docs](https://example.com/a) for details.',
+    );
+  });
+
+  it('leaves chained subscripting alone in a body that defines no labels', async () => {
+    expect(await excerptFor('Reading grid[i][j] and order["data"][0] raises KeyError.')).toBe(
+      'Reading grid[i][j] and order["data"][0] raises KeyError.',
+    );
+  });
+
+  // -- the resolvable case ---------------------------------------------------
+
+  it('flattens a reference link whose definition sits past the excerpt window', async () => {
+    // The reported shape: the link is intact and unresolvable to the caller
+    // because its definition never survives into the excerpt.
+    const excerpt = await excerptFor(
+      `I have an [asynchronous API][1] which I'm using to connect and send mail to an SMTP server.\n\n${PADDING}\n\n  [1]: https://github.com/vuamitom/tornado-smtpclient\n`,
+    );
+    expect(excerpt).toBeDefined();
+    expect(excerpt!.startsWith("I have an asynchronous API which I'm using to connect")).toBe(true);
+    expect(excerpt).not.toContain('[1]');
+    expect(excerpt).not.toContain('][');
+  });
+
+  it('flattens a reference link that survives the cut whole', async () => {
+    expect(
+      await excerptFor(
+        'Follow [the migration guide][guide] before upgrading.\n\n  [guide]: https://example.com/guide\n',
+      ),
+    ).toBe('Follow the migration guide before upgrading.');
+  });
+
+  it('flattens a reference link that straddles the cut, leaving no half bracket', async () => {
+    const excerpt = await excerptFor(
+      `${PADDING}see [the asynchronous API][1] and more.\n\n  [1]: https://example.com/api\n`,
+    );
+    expect(excerpt).toBeDefined();
+    expect(excerpt!.endsWith('…')).toBe(true);
+    expect(excerpt).not.toContain('[');
+    expect(excerpt).not.toContain(']');
+  });
+
+  it('resolves the shorthand form from its own text', async () => {
+    expect(
+      await excerptFor(
+        'Read [the manual][] before filing.\n\n  [the manual]: https://example.com/manual\n',
+      ),
+    ).toBe('Read the manual before filing.');
+  });
+
+  it('matches the label case-insensitively with internal whitespace collapsed', async () => {
+    expect(
+      await excerptFor(
+        'Check [the async API][Async   Docs] first.\n\n  [aSYNC docs]: https://example.com/async\n',
+      ),
+    ).toBe('Check the async API first.');
+  });
+
+  it('flattens every use of a label the body defines more than once', async () => {
+    expect(
+      await excerptFor(
+        'See [the guide][1], then read [the guide again][1].\n\n  [1]: https://example.com/guide\n  [1]: https://example.com/guide-mirror\n',
+      ),
+    ).toBe('See the guide, then read the guide again.');
+  });
+
+  it('flattens a reference image to its alt text without stranding the bang', async () => {
+    expect(
+      await excerptFor(
+        'The failure looks like ![this screenshot][img] on startup.\n\n  [img]: https://example.com/shot.png\n',
+      ),
+    ).toBe('The failure looks like this screenshot on startup.');
+  });
+
+  // -- the unresolvable case: prose, not markup ------------------------------
+
+  it('leaves a driver-style error prefix in a blockquote untouched', async () => {
+    // Reachable by the excerpt precisely because it sits in a blockquote rather
+    // than a code block — flattening it would delete "[SQL Server]" outright.
+    expect(
+      await excerptFor(
+        '> [Microsoft][SQL Server]Cannot open backup device. Operating system error 5.\n\nI get this when running the job. Any ideas?\n\n    exec sp_do_backup @db = [mydb][archive]\n',
+      ),
+    ).toBe(
+      '[Microsoft][SQL Server]Cannot open backup device. Operating system error 5. I get this when running the job. Any ideas?',
+    );
+  });
+
+  it('leaves adjacent tag mentions untouched even when the body defines other labels', async () => {
+    expect(
+      await excerptFor(
+        'Cross-posted under [c++][java] after reading [the spec][ref].\n\n  [ref]: https://example.com/spec\n',
+      ),
+    ).toBe('Cross-posted under [c++][java] after reading the spec.');
+  });
+
+  it('leaves chained subscripting alone in a body that does define a label', async () => {
+    expect(
+      await excerptFor(
+        'Reading grid[i][j] fails since [the fix][1] landed.\n\n  [1]: https://example.com/fix\n',
+      ),
+    ).toBe('Reading grid[i][j] fails since the fix landed.');
+  });
+
+  // -- definition lines ------------------------------------------------------
+
+  it('drops a definition line rather than letting it become excerpt prose', async () => {
+    // A definition block is conventionally indented two spaces, so the
+    // four-space code stripping never caught it.
+    expect(
+      await excerptFor(
+        'I have an [asynchronous API][1] which I am using to connect.\n\nMore prose here to pad it out a little.\n\n  [1]: https://example.com/api\n',
+      ),
+    ).toBe(
+      'I have an asynchronous API which I am using to connect. More prose here to pad it out a little.',
+    );
+  });
+
+  it('keeps a bracketed prose line that is not a definition', async () => {
+    expect(await excerptFor('[Note]: this only happens on startup, never later.')).toBe(
+      '[Note]: this only happens on startup, never later.',
+    );
+  });
+
+  it('omits the excerpt when the body is nothing but a definition line', async () => {
+    expect(await excerptFor('  [1]: https://example.com/api\n')).toBeUndefined();
+  });
+
+  // -- blockquote markers ----------------------------------------------------
+
+  it('drops a leading blockquote marker before the lines collapse onto one', async () => {
+    expect(await excerptFor('> Quoted line.\n> Second quoted line.\n\nMy own question.')).toBe(
+      'Quoted line. Second quoted line. My own question.',
+    );
+  });
+
+  it('drops nested blockquote markers', async () => {
+    expect(await excerptFor('> > Quoted twice.\n> Quoted once.\n\nAnd my own question.')).toBe(
+      'Quoted twice. Quoted once. And my own question.',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

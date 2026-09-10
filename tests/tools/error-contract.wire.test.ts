@@ -417,6 +417,45 @@ describe('search excerpt on the wire', () => {
     expect((result.structuredContent as { page: number }).page).toBe(1);
     expect(wireText(result)).toContain(`It's branch prediction. Why so fast?`);
   });
+
+  // -------------------------------------------------------------------------
+  // #26 — markdown syntax stripped from the excerpt on both surfaces
+  // -------------------------------------------------------------------------
+
+  it('flattens a resolvable reference link, drops the definition and quote marker, and leaves an unresolved pair alone', async () => {
+    mockFetch(() =>
+      seOk({
+        items: [
+          {
+            question_id: 37433157,
+            title: 'Sending mail with an async SMTP client',
+            link: 'https://stackoverflow.com/q/37433157',
+            score: 12,
+            answer_count: 2,
+            is_answered: true,
+            tags: ['python', 'tornado'],
+            // Entity-encoded the way SE ships body_markdown — the quote marker
+            // arrives as &gt;, so decoding has to precede the strip.
+            body_markdown:
+              '&gt; [Microsoft][SQL Server]Cannot open backup device.\n\nI have an [asynchronous API][1] which I&#39;m using to connect.\n\n  [1]: https://github.com/vuamitom/tornado-smtpclient\n',
+          },
+        ],
+      }),
+    );
+
+    const result = await runToolContract(stackexchangeSearchQuestions, { query: 'async smtp' });
+
+    expect(result.isError).toBeFalsy();
+    // Parsed through the tool's own output schema — the framework builds
+    // structuredContent that way, so an undeclared field would be stripped here.
+    const excerpt = stackexchangeSearchQuestions.output.parse(result.structuredContent).questions[0]
+      ?.excerpt;
+    expect(excerpt).toBe(
+      "[Microsoft][SQL Server]Cannot open backup device. I have an asynchronous API which I'm using to connect.",
+    );
+    // The same prose on the format()-only surface, not just in the JSON one.
+    expect(wireText(result)).toContain(excerpt!);
+  });
 });
 
 // ---------------------------------------------------------------------------

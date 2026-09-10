@@ -98,7 +98,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
               .optional()
               .describe(
                 'Opening prose of the question body, trimmed to roughly 300 characters and ending in "…" when cut. ' +
-                  'Code blocks are omitted; absent when the question body is nothing but code.',
+                  'Code blocks and markdown structure are omitted; absent when the question body is nothing but code.',
               ),
             creationDate: z
               .string()
