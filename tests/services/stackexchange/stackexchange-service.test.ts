@@ -412,6 +412,596 @@ describe('StackExchangeService.getThread accepted-answer merge', () => {
   });
 });
 
+describe('StackExchangeService.getThread comment fetching', () => {
+  const QUESTION_ID = 11227809;
+  const ACCEPTED_ID = 11227902;
+  const OTHER_ID = 11227809111;
+
+  /** Mirrors MAX_COMMENTS_PER_POST in stackexchange-service.ts. */
+  const COMMENTS_CAP = 20;
+
+  const commentItem = (
+    postId: number,
+    commentId: number,
+    overrides: Record<string, unknown> = {},
+  ) => ({
+    comment_id: commentId,
+    post_id: postId,
+    score: 1,
+    creation_date: 1_708_378_290,
+    body: 'A comment.',
+    owner: { display_name: 'Commenter', link: 'https://stackoverflow.com/users/1/commenter' },
+    ...overrides,
+  });
+
+  /**
+   * Serve the whole getThread call graph. `questionComments` / `answerComments`
+   * are the raw item lists the two comment routes return; `answerCommentsHasMore`
+   * reproduces a combined page cut short.
+   */
+  const mockThread = (opts: {
+    answers?: Record<string, unknown>[];
+    questionComments?: Record<string, unknown>[];
+    answerComments?: Record<string, unknown>[];
+    answerCommentsHasMore?: boolean;
+    questionCommentsHasMore?: boolean;
+  }) => {
+    const answers = opts.answers ?? [
+      {
+        answer_id: ACCEPTED_ID,
+        question_id: QUESTION_ID,
+        score: 100,
+        is_accepted: true,
+        body: '<p>A.</p>',
+      },
+    ];
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/comments')) {
+        const isQuestionRoute = url.includes('/questions/');
+        return jsonResponse({
+          items: isQuestionRoute ? (opts.questionComments ?? []) : (opts.answerComments ?? []),
+          has_more: isQuestionRoute
+            ? (opts.questionCommentsHasMore ?? false)
+            : (opts.answerCommentsHasMore ?? false),
+          quota_remaining: 90,
+          quota_max: 300,
+        });
+      }
+      if (url.includes('/answers')) {
+        return jsonResponse({
+          items: answers,
+          has_more: false,
+          quota_remaining: 95,
+          quota_max: 300,
+        });
+      }
+      return jsonResponse({
+        items: [
+          {
+            question_id: QUESTION_ID,
+            title: 'A commented question',
+            link: 'https://stackoverflow.com/q/11227809',
+            score: 28_000,
+            answer_count: answers.length,
+            is_answered: true,
+            tags: ['java'],
+            body: '<p>Q.</p>',
+          },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      });
+    });
+  };
+
+  // -- characterization: the default path, unchanged ------------------------
+
+  it('issues no comment request and attaches no comments when includeComments is omitted', async () => {
+    const fetchSpy = mockThread({ questionComments: [commentItem(QUESTION_ID, 1)] });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID },
+      createMockContext(),
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy.mock.calls.some(([u]) => String(u).includes('/comments'))).toBe(false);
+    expect(thread.comments).toBeUndefined();
+    expect(thread.answers[0]?.comments).toBeUndefined();
+  });
+
+  it('issues no comment request when includeComments is explicitly false', async () => {
+    const fetchSpy = mockThread({});
+
+    await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: false },
+      createMockContext(),
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  // -- the opted-in path -----------------------------------------------------
+
+  it('adds exactly two calls regardless of how many answers were fetched', async () => {
+    const manyAnswers = Array.from({ length: 8 }, (_, i) => ({
+      answer_id: 1000 + i,
+      question_id: QUESTION_ID,
+      score: 50 - i,
+      is_accepted: i === 0,
+      body: '<p>A.</p>',
+    }));
+    const fetchSpy = mockThread({ answers: manyAnswers });
+
+    await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    // 2 baseline (question + answers page) + 2 comment calls, not 2 + 8.
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    const commentUrls = fetchSpy.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.includes('/comments'));
+    expect(commentUrls).toHaveLength(2);
+    // Every answer ID rides one semicolon-delimited batch.
+    const batched = commentUrls.find((u) => u.includes('/answers/'));
+    expect(batched).toContain(manyAnswers.map((a) => a.answer_id).join(';'));
+  });
+
+  it('requests both comment routes newest-first with bodies at the route maximum page size', async () => {
+    const fetchSpy = mockThread({});
+
+    await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    const commentCalls = fetchSpy.mock.calls.filter(([u]) => String(u).includes('/comments'));
+    expect(commentCalls).toHaveLength(2);
+    for (const call of commentCalls) {
+      const url = new URL(String(call[0]));
+      expect(url.searchParams.get('filter')).toBe('withbody');
+      expect(url.searchParams.get('sort')).toBe('creation');
+      expect(url.searchParams.get('order')).toBe('desc');
+      // 100 is the route maximum — the widest page makes starvation rare.
+      expect(url.searchParams.get('pagesize')).toBe('100');
+    }
+  });
+
+  it('attaches question and answer comments grouped by post_id, not by request order', async () => {
+    mockThread({
+      answers: [
+        {
+          answer_id: ACCEPTED_ID,
+          question_id: QUESTION_ID,
+          score: 100,
+          is_accepted: true,
+          body: '<p>A.</p>',
+        },
+        {
+          answer_id: OTHER_ID,
+          question_id: QUESTION_ID,
+          score: 5,
+          is_accepted: false,
+          body: '<p>B.</p>',
+        },
+      ],
+      questionComments: [commentItem(QUESTION_ID, 900)],
+      // Interleaved: SE orders the combined page newest-first across every post.
+      answerComments: [
+        commentItem(OTHER_ID, 1),
+        commentItem(ACCEPTED_ID, 2),
+        commentItem(OTHER_ID, 3),
+      ],
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    expect(thread.comments?.map((c) => c.commentId)).toEqual([900]);
+    const byId = new Map(thread.answers.map((a) => [a.answerId, a]));
+    expect(byId.get(ACCEPTED_ID)?.comments?.map((c) => c.commentId)).toEqual([2]);
+    expect(byId.get(OTHER_ID)?.comments?.map((c) => c.commentId)).toEqual([1, 3]);
+  });
+
+  it('normalizes inline code and links in a comment body to markdown', async () => {
+    mockThread({
+      questionComments: [
+        commentItem(QUESTION_ID, 1, {
+          body: 'Use <code>if() add</code> — see <a href="https://en.wikipedia.org/wiki/Branch_predictor" rel="nofollow noreferrer">the history</a>. It isn&#39;t free.',
+        }),
+      ],
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    expect(thread.comments?.[0]?.bodyMarkdown).toBe(
+      "Use `if() add` — see [the history](https://en.wikipedia.org/wiki/Branch_predictor). It isn't free.",
+    );
+  });
+
+  it('maps comment score, author, and ISO 8601 creation date', async () => {
+    mockThread({
+      questionComments: [
+        commentItem(QUESTION_ID, 141067132, {
+          score: 7,
+          creation_date: 1_340_801_496,
+          owner: {
+            display_name: 'Jesper R&#248;nn-Jensen',
+            link: 'https://stackoverflow.com/users/10/jesper',
+          },
+        }),
+      ],
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    expect(thread.comments?.[0]).toMatchObject({
+      commentId: 141067132,
+      score: 7,
+      authorName: 'Jesper Rønn-Jensen',
+      authorLink: 'https://stackoverflow.com/users/10/jesper',
+      creationDate: '2012-06-27T12:51:36.000Z',
+    });
+  });
+
+  it('omits author and date on a comment whose upstream payload lacks them', async () => {
+    mockThread({
+      questionComments: [{ comment_id: 5, post_id: QUESTION_ID, score: 0, body: 'Bare comment.' }],
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    expect(thread.comments?.[0]?.bodyMarkdown).toBe('Bare comment.');
+    expect(thread.comments?.[0]?.authorName).toBeUndefined();
+    expect(thread.comments?.[0]?.authorLink).toBeUndefined();
+    expect(thread.comments?.[0]?.creationDate).toBeUndefined();
+  });
+
+  // -- empty vs. unknown -----------------------------------------------------
+
+  it('reports a genuinely comment-free post as an empty list, not as unknown', async () => {
+    mockThread({ questionComments: [], answerComments: [], answerCommentsHasMore: false });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    expect(thread.comments).toEqual([]);
+    expect(thread.answers[0]?.comments).toEqual([]);
+    expect(thread.answers[0]?.commentsTruncated).toBeUndefined();
+  });
+
+  it('leaves a post starved by a truncated combined page unknown rather than comment-free', async () => {
+    // The live shape: two answer IDs at one page size, every returned comment
+    // belonging to the first, has_more still set. The second contributed nothing
+    // despite having comments of its own.
+    mockThread({
+      answers: [
+        {
+          answer_id: ACCEPTED_ID,
+          question_id: QUESTION_ID,
+          score: 100,
+          is_accepted: true,
+          body: '<p>A.</p>',
+        },
+        {
+          answer_id: OTHER_ID,
+          question_id: QUESTION_ID,
+          score: 5,
+          is_accepted: false,
+          body: '<p>B.</p>',
+        },
+      ],
+      answerComments: [commentItem(ACCEPTED_ID, 1), commentItem(ACCEPTED_ID, 2)],
+      answerCommentsHasMore: true,
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    const byId = new Map(thread.answers.map((a) => [a.answerId, a]));
+    // The starved answer: absent, never an empty array.
+    expect(byId.get(OTHER_ID)?.comments).toBeUndefined();
+    expect(byId.get(OTHER_ID)?.comments).not.toEqual([]);
+    // The answer that did receive comments cannot be proven complete either —
+    // the page is ordered newest-first across posts, so older ones may remain.
+    expect(byId.get(ACCEPTED_ID)?.comments).toHaveLength(2);
+    expect(byId.get(ACCEPTED_ID)?.commentsTruncated).toBe(true);
+  });
+
+  // -- the per-post cap ------------------------------------------------------
+
+  it('caps one post at the per-post limit and marks that post truncated', async () => {
+    const over = Array.from({ length: COMMENTS_CAP + 5 }, (_, i) =>
+      commentItem(ACCEPTED_ID, i + 1),
+    );
+    mockThread({
+      answers: [
+        {
+          answer_id: ACCEPTED_ID,
+          question_id: QUESTION_ID,
+          score: 100,
+          is_accepted: true,
+          body: '<p>A.</p>',
+        },
+        {
+          answer_id: OTHER_ID,
+          question_id: QUESTION_ID,
+          score: 5,
+          is_accepted: false,
+          body: '<p>B.</p>',
+        },
+      ],
+      answerComments: [...over, commentItem(OTHER_ID, 999)],
+      answerCommentsHasMore: false,
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    const byId = new Map(thread.answers.map((a) => [a.answerId, a]));
+    // The cap bites on one post specifically...
+    expect(byId.get(ACCEPTED_ID)?.comments).toHaveLength(COMMENTS_CAP);
+    expect(byId.get(ACCEPTED_ID)?.commentsTruncated).toBe(true);
+    // ...and its neighbour in the same combined page stays whole.
+    expect(byId.get(OTHER_ID)?.comments).toHaveLength(1);
+    expect(byId.get(OTHER_ID)?.commentsTruncated).toBeUndefined();
+  });
+
+  it('marks the question truncated when its own comment page reports more', async () => {
+    mockThread({
+      questionComments: [commentItem(QUESTION_ID, 1)],
+      questionCommentsHasMore: true,
+    });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    expect(thread.comments).toHaveLength(1);
+    expect(thread.commentsTruncated).toBe(true);
+  });
+
+  it('fetches question comments but no answer batch when the question has no answers', async () => {
+    const fetchSpy = mockThread({ answers: [], questionComments: [commentItem(QUESTION_ID, 1)] });
+
+    const { thread } = await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+      createMockContext(),
+    );
+
+    // No answer IDs means no /answers/{ids}/comments route to call — three total.
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    expect(
+      fetchSpy.mock.calls.some(
+        ([u]) => String(u).includes('/answers/') && String(u).includes('/comments'),
+      ),
+    ).toBe(false);
+    expect(thread.comments).toHaveLength(1);
+    expect(thread.answers).toEqual([]);
+  });
+
+  it('includes the merged accepted answer in the batched comment request', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/comments')) {
+        return jsonResponse({ items: [], has_more: false, quota_remaining: 90, quota_max: 300 });
+      }
+      // The explicit single-answer fetch for the out-of-page accepted answer.
+      if (/\/answers\/\d+\?/.test(url)) {
+        return jsonResponse({
+          items: [
+            {
+              answer_id: ACCEPTED_ID,
+              question_id: QUESTION_ID,
+              score: 10,
+              is_accepted: true,
+              body: '<p>Accepted.</p>',
+            },
+          ],
+          has_more: false,
+          quota_remaining: 94,
+          quota_max: 300,
+        });
+      }
+      if (url.includes('/answers')) {
+        return jsonResponse({
+          items: [
+            {
+              answer_id: OTHER_ID,
+              question_id: QUESTION_ID,
+              score: 900,
+              is_accepted: false,
+              body: '<p>Higher voted.</p>',
+            },
+          ],
+          has_more: true,
+          quota_remaining: 95,
+          quota_max: 300,
+        });
+      }
+      return jsonResponse({
+        items: [
+          {
+            question_id: QUESTION_ID,
+            title: 'A capped thread',
+            link: 'https://stackoverflow.com/q/11227809',
+            score: 100,
+            answer_count: 12,
+            is_answered: true,
+            tags: ['java'],
+            body: '<p>Q.</p>',
+            accepted_answer_id: ACCEPTED_ID,
+          },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      });
+    });
+
+    await makeService().getThread(
+      { site: 'stackoverflow', questionId: QUESTION_ID, maxAnswers: 1, includeComments: true },
+      createMockContext(),
+    );
+
+    const batched = fetchSpy.mock.calls
+      .map(([u]) => String(u))
+      .find((u) => u.includes('/answers/') && u.includes('/comments'));
+    expect(batched).toBeDefined();
+    // The merged accepted answer is not in the votes page, but its comments
+    // still ride the same single batched call.
+    expect(decodeURIComponent(batched!)).toContain(`${ACCEPTED_ID}`);
+    expect(decodeURIComponent(batched!)).toContain(`${OTHER_ID}`);
+  });
+
+  // -- error mapping ---------------------------------------------------------
+
+  it('reads an `ids` rejection from the question comments route as a bad question ID', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/questions/') && url.includes('/comments')) {
+        return badParameterResponse('ids');
+      }
+      if (url.includes('/comments')) {
+        return jsonResponse({ items: [], has_more: false, quota_remaining: 90, quota_max: 300 });
+      }
+      if (url.includes('/answers')) {
+        return jsonResponse({
+          items: [
+            {
+              answer_id: ACCEPTED_ID,
+              question_id: QUESTION_ID,
+              score: 1,
+              is_accepted: false,
+              body: '<p>A.</p>',
+            },
+          ],
+          has_more: false,
+          quota_remaining: 95,
+          quota_max: 300,
+        });
+      }
+      return jsonResponse({
+        items: [
+          {
+            question_id: QUESTION_ID,
+            title: 'Q',
+            link: 'https://stackoverflow.com/q/11227809',
+            score: 1,
+            answer_count: 1,
+            is_answered: true,
+            tags: ['java'],
+            body: '<p>Q.</p>',
+          },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      });
+    });
+
+    const error = await makeService()
+      .getThread(
+        { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+        createMockContext(),
+      )
+      .then(
+        () => {
+          throw new Error('Expected the call to reject');
+        },
+        (err: unknown) => err as McpError,
+      );
+
+    expect(error.message).toBe('The question ID is not a valid Stack Exchange question ID.');
+    expect((error.data as Record<string, unknown>).reason).toBe('invalid_id_or_url');
+  });
+
+  it('does not blame the caller for an `ids` rejection from the batched answers comments route', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/answers/') && url.includes('/comments')) {
+        return badParameterResponse('ids');
+      }
+      if (url.includes('/comments')) {
+        return jsonResponse({ items: [], has_more: false, quota_remaining: 90, quota_max: 300 });
+      }
+      if (url.includes('/answers')) {
+        return jsonResponse({
+          items: [
+            {
+              answer_id: ACCEPTED_ID,
+              question_id: QUESTION_ID,
+              score: 1,
+              is_accepted: false,
+              body: '<p>A.</p>',
+            },
+          ],
+          has_more: false,
+          quota_remaining: 95,
+          quota_max: 300,
+        });
+      }
+      return jsonResponse({
+        items: [
+          {
+            question_id: QUESTION_ID,
+            title: 'Q',
+            link: 'https://stackoverflow.com/q/11227809',
+            score: 1,
+            answer_count: 1,
+            is_answered: true,
+            tags: ['java'],
+            body: '<p>Q.</p>',
+          },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      });
+    });
+
+    const error = await makeService()
+      .getThread(
+        { site: 'stackoverflow', questionId: QUESTION_ID, includeComments: true },
+        createMockContext(),
+      )
+      .then(
+        () => {
+          throw new Error('Expected the call to reject');
+        },
+        (err: unknown) => err as McpError,
+      );
+
+    // The answer IDs are SE's own, never the caller's input — the question-ID
+    // wording would send the caller after the wrong thing to fix.
+    expect(error.message).not.toContain('question ID');
+    expect(error.message).toBe('Stack Exchange rejected the "ids" parameter.');
+    expect((error.data as Record<string, unknown>).reason).toBe('invalid_parameter');
+  });
+});
+
 describe('StackExchangeService.getSites pagination', () => {
   /**
    * Mirrors MAX_SITE_PAGES in stackexchange-service.ts — the walk's hard stop.
@@ -1022,5 +1612,403 @@ describe('StackExchangeService recovery hints resolve from the caller contract',
     // against, the spread contributes nothing and the reason still rides.
     expect(data.reason).toBe('user_not_found');
     expect(data).not.toHaveProperty('recovery');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #17 — excerpt derived from body_markdown on /search/advanced
+// ---------------------------------------------------------------------------
+
+describe('StackExchangeService.searchQuestions custom filter', () => {
+  /**
+   * The filter string pinned in stackexchange-service.ts. Asserted as a literal
+   * so swapping it without re-minting against /filters/create fails loudly.
+   */
+  const PINNED_SEARCH_FILTER = '!-tSBS8YTedGMoaqycoVR';
+
+  const emptySearch = { items: [], has_more: false, quota_remaining: 100, quota_max: 300 };
+
+  it('requests /search/advanced with the pinned custom filter', async () => {
+    // Pre-fix the search call carried no filter, so SE's default field set
+    // omitted body_markdown and `excerpt` was absent from every result.
+    const spy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () => jsonResponse(emptySearch));
+
+    await makeService().searchQuestions({ query: 'q', site: 'stackoverflow' }, createMockContext());
+
+    const url = new URL(String(spy.mock.calls[0]![0]));
+    expect(url.searchParams.get('filter')).toBe(PINNED_SEARCH_FILTER);
+  });
+
+  it('leaves /tags/{tag}/faq on the SE default filter', async () => {
+    // getTagFaq maps through the same normalizeQuestion but must not inherit a
+    // `base=none` filter minted for the search route.
+    const spy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () => jsonResponse(emptySearch));
+
+    await makeService().getTagFaq({ tag: 'python', site: 'stackoverflow' }, createMockContext());
+
+    expect(new URL(String(spy.mock.calls[0]![0])).searchParams.get('filter')).toBeNull();
+  });
+});
+
+describe('StackExchangeService excerpt derivation', () => {
+  /** Mirrors EXCERPT_MAX_CHARS in stackexchange-service.ts. */
+  const EXCERPT_MAX_CHARS = 300;
+
+  const questionWithBody = (bodyMarkdown: string | undefined) => ({
+    question_id: 1,
+    title: 'A question',
+    link: 'https://stackoverflow.com/q/1',
+    score: 5,
+    answer_count: 1,
+    is_answered: true,
+    tags: ['python'],
+    ...(bodyMarkdown === undefined ? {} : { body_markdown: bodyMarkdown }),
+  });
+
+  /** Run searchQuestions against one item carrying `body` and return its excerpt. */
+  const excerptFor = async (body: string | undefined): Promise<string | undefined> => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      jsonResponse({
+        items: [questionWithBody(body)],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      }),
+    );
+    const { questions } = await makeService().searchQuestions(
+      { query: 'q', site: 'stackoverflow' },
+      createMockContext(),
+    );
+    return questions[0]?.excerpt;
+  };
+
+  it('derives the excerpt from body_markdown', async () => {
+    // Pre-fix body_markdown was never requested and never read — excerpt was
+    // declared, described, and absent from every result.
+    expect(await excerptFor('Say I have two async generators and want to merge them.')).toBe(
+      'Say I have two async generators and want to merge them.',
+    );
+  });
+
+  it('decodes HTML entities the way title already does', async () => {
+    // body_markdown arrives HTML-encoded: &#39; for an apostrophe, &quot; for a quote.
+    expect(await excerptFor('It&#39;s a &quot;merge&quot; of &lt;T&gt; values &amp; keys.')).toBe(
+      `It's a "merge" of <T> values & keys.`,
+    );
+  });
+
+  it('decodes before truncating, so no entity is split across the boundary', async () => {
+    // An entity straddling EXCERPT_MAX_CHARS would leave `&qu` if the cut came first.
+    const filler = 'word '.repeat(60); // 300 chars
+    const excerpt = await excerptFor(`${filler}&quot;quoted&quot; tail that runs past the cap.`);
+    expect(excerpt).toBeDefined();
+    expect(excerpt).not.toContain('&qu');
+    expect(excerpt).not.toContain('&#');
+    expect(excerpt).not.toMatch(/&[a-z]+$/);
+  });
+
+  it('truncates at a word boundary and marks the cut', async () => {
+    const body = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet '.repeat(10);
+    const excerpt = await excerptFor(body);
+    expect(excerpt).toBeDefined();
+    expect(excerpt!.length).toBeLessThanOrEqual(EXCERPT_MAX_CHARS + 1);
+    expect(excerpt!.endsWith('…')).toBe(true);
+    // The character before the ellipsis ends a whole word, never a split one.
+    expect(body.split(' ')).toContain(excerpt!.slice(0, -1).split(' ').pop());
+  });
+
+  it('returns the whole body untruncated and unmarked when it fits', async () => {
+    const excerpt = await excerptFor('Short enough to survive whole.');
+    expect(excerpt).toBe('Short enough to survive whole.');
+    expect(excerpt).not.toContain('…');
+  });
+
+  it('drops fenced code blocks rather than truncating into one', async () => {
+    const excerpt = await excerptFor(
+      'Here is the failing call:\n\n```python\nasync def f():\n    yield 1\n```\n\nWhy does it hang?',
+    );
+    expect(excerpt).toBe('Here is the failing call: Why does it hang?');
+    expect(excerpt).not.toContain('```');
+    expect(excerpt).not.toContain('yield');
+  });
+
+  it('drops an unpaired opening fence and everything after it', async () => {
+    const excerpt = await excerptFor('Leading prose.\n\n```python\nasync def f():\n    yield 1');
+    expect(excerpt).toBe('Leading prose.');
+    expect(excerpt).not.toContain('```');
+  });
+
+  it('drops indented code blocks, which is how SE renders code in body_markdown', async () => {
+    // Verified live: /search/advanced body_markdown carries 4-space indented code,
+    // not fences.
+    const excerpt = await excerptFor(
+      'Say I have two async generators:\n\n    async def get_rules():\n        while True:\n            yield 1\n\nI want to merge them.',
+    );
+    expect(excerpt).toBe('Say I have two async generators: I want to merge them.');
+    expect(excerpt).not.toContain('async def');
+  });
+
+  it('omits the excerpt when the body is nothing but code', async () => {
+    // Better absent than an excerpt fabricated out of stripped markup.
+    expect(await excerptFor('```js\nconst a = 1;\n```')).toBeUndefined();
+  });
+
+  it('omits the excerpt when the body is empty or whitespace', async () => {
+    expect(await excerptFor('')).toBeUndefined();
+    expect(await excerptFor('   \n\n  ')).toBeUndefined();
+  });
+
+  it('omits the excerpt when the route carries no body at all', async () => {
+    // The /tags/{tag}/faq shape: same mapper, SE default filter, no body.
+    expect(await excerptFor(undefined)).toBeUndefined();
+  });
+
+  it('closes an inline-code span the cut left open', async () => {
+    const body = `${'padding word '.repeat(22)}\`unterminated_code_span_that_runs_past_the_cap`;
+    const excerpt = await excerptFor(body);
+    expect(excerpt).toBeDefined();
+    expect((excerpt!.match(/`/g) ?? []).length % 2).toBe(0);
+  });
+
+  it('drops a markdown link the cut left half-open', async () => {
+    const body = `${'padding word '.repeat(21)}see [the docs](https://example.com/a/very/long/path)`;
+    const excerpt = await excerptFor(body);
+    expect(excerpt).toBeDefined();
+    expect(excerpt).not.toContain('](');
+    expect(excerpt).not.toContain('[the docs]');
+  });
+
+  it('leaves a bracketed expression that is not a link alone', async () => {
+    expect(await excerptFor('Reading array[0] raises IndexError.')).toBe(
+      'Reading array[0] raises IndexError.',
+    );
+  });
+
+  it('derives an excerpt per item, leaving a body-less sibling without one', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      jsonResponse({
+        items: [
+          { ...questionWithBody('First question body text.'), question_id: 1 },
+          { ...questionWithBody(undefined), question_id: 2 },
+        ],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      }),
+    );
+
+    const { questions } = await makeService().searchQuestions(
+      { query: 'q', site: 'stackoverflow' },
+      createMockContext(),
+    );
+
+    expect(questions[0]?.excerpt).toBe('First question body text.');
+    expect(questions[1]?.excerpt).toBeUndefined();
+  });
+
+  it('getTagFaq maps through the same mapper without an excerpt', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      jsonResponse({
+        items: [questionWithBody(undefined)],
+        has_more: false,
+        quota_remaining: 100,
+        quota_max: 300,
+      }),
+    );
+
+    const { questions } = await makeService().getTagFaq(
+      { tag: 'python', site: 'stackoverflow' },
+      createMockContext(),
+    );
+
+    expect(questions[0]?.excerpt).toBeUndefined();
+    expect(questions[0]?.title).toBe('A question');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #18 — paging
+// ---------------------------------------------------------------------------
+
+describe('StackExchangeService paging', () => {
+  const emptyWrapper = { items: [], has_more: false, quota_remaining: 100, quota_max: 300 };
+
+  const captureUrl = async (run: (svc: StackExchangeService) => Promise<unknown>): Promise<URL> => {
+    const spy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () => jsonResponse(emptyWrapper));
+    await run(makeService());
+    expect(spy).toHaveBeenCalledTimes(1);
+    return new URL(String(spy.mock.calls[0]![0]));
+  };
+
+  it('forwards page to /search/advanced', async () => {
+    const url = await captureUrl((svc) =>
+      svc.searchQuestions({ query: 'q', site: 'stackoverflow', page: 3 }, createMockContext()),
+    );
+    expect(url.searchParams.get('page')).toBe('3');
+  });
+
+  it('forwards page to /tags/{tag}/faq', async () => {
+    const url = await captureUrl((svc) =>
+      svc.getTagFaq({ tag: 'python', site: 'stackoverflow', page: 4 }, createMockContext()),
+    );
+    expect(url.searchParams.get('page')).toBe('4');
+  });
+
+  it('omits page from /search/advanced when the caller supplies none', async () => {
+    const url = await captureUrl((svc) =>
+      svc.searchQuestions({ query: 'q', site: 'stackoverflow' }, createMockContext()),
+    );
+    expect(url.searchParams.get('page')).toBeNull();
+  });
+
+  it('omits page from /tags/{tag}/faq when the caller supplies none', async () => {
+    const url = await captureUrl((svc) =>
+      svc.getTagFaq({ tag: 'python', site: 'stackoverflow' }, createMockContext()),
+    );
+    expect(url.searchParams.get('page')).toBeNull();
+  });
+
+  it('leaves pagesize untouched when paging', async () => {
+    const url = await captureUrl((svc) =>
+      svc.searchQuestions(
+        { query: 'q', site: 'stackoverflow', page: 2, pageSize: 30 },
+        createMockContext(),
+      ),
+    );
+    expect(url.searchParams.get('pagesize')).toBe('30');
+    expect(url.searchParams.get('page')).toBe('2');
+  });
+});
+
+describe('StackExchangeService paging depth limit', () => {
+  /**
+   * SE's keyless paging wall, reproduced live against api.stackexchange.com on
+   * both routes: the envelope carries `error_id: 403`, but the HTTP status line
+   * is 400 — the same status `bad_parameter` arrives under. Keying on the status
+   * alone therefore cannot tell the two apart; `error_name` is what separates them.
+   */
+  const seAccessDenied = (errorMessage = 'page above 25 requires access token or app key') =>
+    new Response(
+      JSON.stringify({ error_id: 403, error_message: errorMessage, error_name: 'access_denied' }),
+      { status: 400 },
+    );
+
+  const CONTRACT = [
+    {
+      reason: 'paging_depth_limit',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'SE refused the requested page depth.',
+      recovery: 'Recovery text for the paging depth case.',
+    },
+  ] as const;
+
+  const rejection = async (run: () => Promise<unknown>): Promise<McpError> => {
+    const error = await run().then(
+      () => {
+        throw new Error('Expected the call to reject');
+      },
+      (err: unknown) => err,
+    );
+    expect(error).toBeInstanceOf(McpError);
+    return error as McpError;
+  };
+
+  it('classifies the keyless paging wall as paging_depth_limit on searchQuestions', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => seAccessDenied());
+
+    const error = await rejection(() =>
+      makeService().searchQuestions(
+        { query: 'q', site: 'stackoverflow', page: 26 },
+        createMockContext({ errors: CONTRACT }),
+      ),
+    );
+
+    // Pre-fix an access_denied envelope fell through to the framework's generic
+    // HTTP classifier: no reason, no recovery hint, nothing for the caller to act on.
+    expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+    expect(error.message).toContain('page above 25 requires access token or app key');
+    expect(error.data).toMatchObject({
+      reason: 'paging_depth_limit',
+      recovery: { hint: 'Recovery text for the paging depth case.' },
+      error_name: 'access_denied',
+      error_id: 403,
+    });
+    // Forbidden is not a retryable code — one upstream call, one quota unit.
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('classifies the keyless paging wall as paging_depth_limit on getTagFaq', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => seAccessDenied());
+
+    const error = await rejection(() =>
+      makeService().getTagFaq(
+        { tag: 'python', site: 'stackoverflow', page: 30 },
+        createMockContext({ errors: CONTRACT }),
+      ),
+    );
+
+    expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+    expect((error.data as Record<string, unknown>).reason).toBe('paging_depth_limit');
+  });
+
+  it('never reports it as invalid_parameter — nothing about the request was malformed', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => seAccessDenied());
+
+    const error = await rejection(() =>
+      makeService().searchQuestions(
+        { query: 'q', site: 'stackoverflow', page: 26 },
+        createMockContext({ errors: CONTRACT }),
+      ),
+    );
+
+    expect((error.data as Record<string, unknown>).reason).not.toBe('invalid_parameter');
+    expect(error.code).not.toBe(JsonRpcErrorCode.ValidationError);
+  });
+
+  it('leaves an access_denied that is not about paging to the framework classifier', async () => {
+    // A revoked or malformed key also answers access_denied; calling that a paging
+    // depth limit would send the caller after the wrong remedy.
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      seAccessDenied('requires authentication'),
+    );
+
+    const error = await rejection(() =>
+      makeService().searchQuestions(
+        { query: 'q', site: 'stackoverflow' },
+        createMockContext({ errors: CONTRACT }),
+      ),
+    );
+
+    expect((error.data as Record<string, unknown>).reason).toBeUndefined();
+    expect((error.data as Record<string, unknown>).errorSource).toBe('FetchHttpError');
+  });
+
+  it('still routes a bad_parameter rejection through the caller mapping', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => badParameterResponse('pagesize'));
+
+    const error = await rejection(() =>
+      makeService().searchQuestions(
+        { query: 'q', site: 'stackoverflow', page: 2 },
+        createMockContext({
+          errors: [
+            {
+              reason: 'invalid_parameter',
+              code: JsonRpcErrorCode.ValidationError,
+              when: 'A named parameter was refused.',
+              recovery: 'Recovery text for the rejected parameter case.',
+            },
+          ] as const,
+        }),
+      ),
+    );
+
+    expect((error.data as Record<string, unknown>).reason).toBe('invalid_parameter');
+    expect(error.message).toContain('pagesize');
   });
 });

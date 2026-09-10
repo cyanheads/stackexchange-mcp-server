@@ -27,6 +27,11 @@ export interface SeQuestion {
   answer_count: number;
   /** Present only when filter=withbody is used. */
   body?: string;
+  /**
+   * Markdown source of the post, HTML-entity-encoded. Present only under a
+   * custom filter that names it — the search route's SE_SEARCH_FILTER does.
+   */
+  body_markdown?: string;
   creation_date?: number;
   /** Excerpt from search results (search endpoint only). */
   excerpt?: string;
@@ -51,6 +56,27 @@ export interface SeAnswer {
   last_activity_date?: number;
   owner?: SeShallowUser;
   question_id: number;
+  score: number;
+}
+
+/**
+ * A Stack Exchange comment (raw upstream).
+ *
+ * Unlike a question or an answer, the comment type carries no `body_markdown`
+ * under any filter — `body` (entity-encoded HTML, present only under
+ * `filter=withbody`) is the only body form SE offers, so it needs the same
+ * `normalizeHtml` pass a post body gets. `post_id` is what ties a comment back
+ * to its parent: `/answers/{ids}/comments` answers with ONE combined list
+ * across every requested ID, so request order says nothing about ownership.
+ */
+export interface SeComment {
+  /** Present only when filter=withbody is used. */
+  body?: string;
+  comment_id: number;
+  creation_date?: number;
+  owner?: SeShallowUser;
+  /** The question or answer this comment hangs off — the only grouping key. */
+  post_id: number;
   score: number;
 }
 

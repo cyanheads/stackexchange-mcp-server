@@ -7,6 +7,8 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
+  configurationError,
+  forbidden,
   McpError,
   notFound,
   rateLimited,
@@ -18,6 +20,7 @@ import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { decodeHtmlEntities, normalizeHtml } from './html-normalizer.js';
 import type {
   SeAnswer,
+  SeComment,
   SeError,
   SeQuestion,
   SeSite,
@@ -58,10 +61,126 @@ const MAX_SITE_PAGES = 10;
  */
 const SE_USER_FILTER = '!fgp_FAe)vSKeMW4GBo(u*a)doNjyqH*B';
 
+/**
+ * Custom filter for /search/advanced. `question.excerpt` is not a field on the
+ * `question` type — SE drops it from a minted filter without an error — so the
+ * search result excerpt is derived from `body_markdown`, which the same call
+ * returns. No extra request, no route change.
+ *
+ * Built with `base=none`, so it returns ONLY these fields — every field the
+ * normalizeQuestion mapping reads must be listed:
+ *   wrapper:  .backoff .error_id .error_message .error_name .has_more .items
+ *             .quota_max .quota_remaining
+ *   question: question_id title link score answer_count is_answered tags
+ *             creation_date last_activity_date body_markdown
+ *
+ * Regenerate by re-requesting /filters/create with `base=none` and that
+ * `include` list, then confirm the response's `included_fields` echoes every
+ * one back — a field name SE does not recognize is dropped silently, so a call
+ * that merely succeeds proves nothing.
+ */
+const SE_SEARCH_FILTER = '!-tSBS8YTedGMoaqycoVR';
+
+/** Longest excerpt carried on a search result, in characters. */
+const EXCERPT_MAX_CHARS = 300;
+
+/**
+ * Page size for both comment routes — 100 is the SE maximum.
+ *
+ * `/answers/{ids}/comments` returns ONE combined list across every requested
+ * answer, so this caps the total the page can hold, not each post's share. The
+ * widest page is what makes it unlikely that a heavily-commented answer consumes
+ * the whole page and starves a later one; it cannot rule it out, which is why
+ * the caller still has to tell "no comments" apart from "none in this page".
+ */
+const COMMENTS_PAGE_SIZE = 100;
+
+/**
+ * Longest comment list carried on any one post. The combined page is shared
+ * across posts, so this is applied client-side per post after grouping.
+ */
+const MAX_COMMENTS_PER_POST = 20;
+
+/** A paired fenced code block, fences included. */
+const FENCED_CODE_BLOCK = /```[\s\S]*?```/g;
+
+/** An unpaired opening fence and everything after it. */
+const TRAILING_FENCE = /```[\s\S]*$/;
+
+/**
+ * A markdown indented code block line. SE renders code in `body_markdown` as
+ * four-space indentation rather than fences, so this is the common case.
+ */
+const INDENTED_CODE_LINE = /^(?: {4}|\t).*$/gm;
+
+/** A markdown link whose closing `)` the cut removed — `[text](https://exa`. */
+const UNCLOSED_LINK = /^\[[^\]]*\]\([^)]*$/;
+
 /** Convert SE's Unix epoch seconds to an ISO 8601 string. */
 function toIsoDate(epochSeconds: number): string {
   return new Date(epochSeconds * 1000).toISOString();
 }
+
+/**
+ * Drop a markdown construct the cut left open. Two survive whitespace collapsing
+ * on an SE body: an inline-code span (odd backtick count) and a link whose
+ * `](url)` half was clipped. Applied only to a truncated excerpt — on a whole
+ * body an odd backtick is the author's, not the truncation's.
+ */
+function trimDanglingMarkdown(text: string): string {
+  let out = text;
+
+  if ((out.match(/`/g)?.length ?? 0) % 2 === 1) {
+    out = out.slice(0, out.lastIndexOf('`'));
+  }
+
+  const linkStart = out.lastIndexOf('[');
+  if (linkStart >= 0 && UNCLOSED_LINK.test(out.slice(linkStart))) {
+    out = out.slice(0, out[linkStart - 1] === '!' ? linkStart - 1 : linkStart);
+  }
+
+  return out.trimEnd();
+}
+
+/**
+ * Reduce a question body to a short prose excerpt.
+ *
+ * Entities are decoded first: `body_markdown` arrives HTML-encoded (`&quot;`,
+ * `&#39;`) the way `title` does, and cutting before decoding can split an entity
+ * into `&qu`. Code blocks come out rather than being truncated into — a clipped
+ * fence dangles, and a flattened code block is noise in a one-paragraph excerpt.
+ * Returns undefined when nothing but code and whitespace was there, so a caller
+ * gets no excerpt rather than a fabricated one.
+ */
+function deriveExcerpt(bodyMarkdown: string): string | undefined {
+  const prose = decodeHtmlEntities(bodyMarkdown)
+    .replace(FENCED_CODE_BLOCK, ' ')
+    .replace(TRAILING_FENCE, ' ')
+    .replace(INDENTED_CODE_LINE, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!prose) return undefined;
+  if (prose.length <= EXCERPT_MAX_CHARS) return prose;
+
+  const cut = prose.slice(0, EXCERPT_MAX_CHARS);
+  const lastSpace = cut.lastIndexOf(' ');
+  const clipped = trimDanglingMarkdown((lastSpace > 0 ? cut.slice(0, lastSpace) : cut).trimEnd());
+
+  return clipped ? `${clipped}…` : undefined;
+}
+
+/**
+ * Stack Exchange refusing the API key the server was configured with. SE reports
+ * it as `bad_parameter` like any other refused field, but the `error_message` is
+ * prose naming the `key` parameter — "`key` doesn't match a known application" —
+ * rather than the bare field name every caller-supplied rejection carries.
+ *
+ * Anchored at the start of the message so a field name that merely contains
+ * "key" stays a caller parameter problem, and matched with or without SE's
+ * backticks since the two rejection wordings differ in that alone.
+ */
+const UNRECOGNIZED_KEY_MESSAGE = /^`?key(?:`|\b)/i;
 
 /**
  * How one call site reports a `bad_parameter` rejection that is not about the
@@ -132,6 +251,8 @@ export interface SearchQuestionsOptions {
   /** API key from server config — injected by the service. */
   apiKey?: string;
   minScore?: number;
+  /** 1-based upstream page. Omitted from the request when absent — SE defaults to 1. */
+  page?: number;
   pageSize?: number;
   query: string;
   site: string;
@@ -155,6 +276,8 @@ export interface GetUserOptions {
 
 export interface GetTagFaqOptions {
   apiKey?: string;
+  /** 1-based upstream page. Omitted from the request when absent — SE defaults to 1. */
+  page?: number;
   pageSize?: number;
   site: string;
   tag: string;
@@ -180,8 +303,33 @@ export interface NormalizedQuestion {
   title: string;
 }
 
+/** Normalized comment hanging off a question or an answer. */
+export interface NormalizedComment {
+  authorLink?: string;
+  authorName?: string;
+  bodyMarkdown: string;
+  commentId: number;
+  /** ISO 8601 timestamp of when the comment was posted. */
+  creationDate?: string;
+  score: number;
+}
+
+/**
+ * A post's comment state. The absent-vs-empty distinction is load-bearing:
+ * `comments: []` means the post has none, while an absent `comments` means the
+ * fetch could not establish its state — comments were not requested, or the
+ * combined page ran out before this post contributed anything. Rendering the
+ * second as the first tells the caller a post is uncommented when it is not.
+ */
+interface CommentState {
+  /** Absent when the post's comment state is unknown, never as a stand-in for none. */
+  comments?: NormalizedComment[];
+  /** True when `comments` is known to be a partial list for this post. */
+  commentsTruncated?: boolean;
+}
+
 /** Normalized answer for thread output. */
-export interface NormalizedAnswer {
+export interface NormalizedAnswer extends CommentState {
   answerId: number;
   authorLink?: string;
   authorName?: string;
@@ -197,7 +345,7 @@ export interface NormalizedAnswer {
 }
 
 /** Normalized thread for tool output. */
-export interface NormalizedThread {
+export interface NormalizedThread extends CommentState {
   acceptedAnswerId?: number;
   answerCount: number;
   answers: NormalizedAnswer[];
@@ -242,8 +390,20 @@ export interface NormalizedSite {
   siteUrl: string;
 }
 
-/** Map a raw SE question onto the normalized shape shared by search and tag FAQ. */
+/**
+ * Map a raw SE question onto the normalized shape shared by search and tag FAQ.
+ *
+ * Only /search/advanced carries a body — /tags/{tag}/faq keeps SE's default
+ * filter — so the excerpt is derived when one is present and left absent when
+ * it is not, rather than assumed.
+ */
 function normalizeQuestion(q: SeQuestion): NormalizedQuestion {
+  const excerpt = q.body_markdown
+    ? deriveExcerpt(q.body_markdown)
+    : q.excerpt
+      ? decodeHtmlEntities(q.excerpt)
+      : undefined;
+
   return {
     questionId: q.question_id,
     title: decodeHtmlEntities(q.title),
@@ -252,11 +412,46 @@ function normalizeQuestion(q: SeQuestion): NormalizedQuestion {
     answerCount: q.answer_count,
     isAnswered: q.is_answered,
     tags: q.tags,
-    ...(q.excerpt ? { excerpt: decodeHtmlEntities(q.excerpt) } : {}),
+    ...(excerpt !== undefined ? { excerpt } : {}),
     ...(q.creation_date !== undefined ? { creationDate: toIsoDate(q.creation_date) } : {}),
     ...(q.last_activity_date !== undefined
       ? { lastActivityDate: toIsoDate(q.last_activity_date) }
       : {}),
+  };
+}
+
+/**
+ * Map a raw SE comment onto the normalized shape.
+ *
+ * The body arrives as entity-encoded HTML — the comment type has no
+ * `body_markdown` counterpart to the post types' — so it takes the same
+ * `normalizeHtml` pass. Comments carry inline markup only (`<code>`, `<a>`,
+ * `<b>`), which that pipeline already covers.
+ */
+function normalizeComment(c: SeComment): NormalizedComment {
+  return {
+    commentId: c.comment_id,
+    score: c.score,
+    bodyMarkdown: normalizeHtml(c.body ?? ''),
+    ...(c.owner?.display_name ? { authorName: decodeHtmlEntities(c.owner.display_name) } : {}),
+    ...(c.owner?.link ? { authorLink: c.owner.link } : {}),
+    ...(c.creation_date !== undefined ? { creationDate: toIsoDate(c.creation_date) } : {}),
+  };
+}
+
+/**
+ * Reduce one post's share of a comment page to its capped, normalized list.
+ *
+ * `pageHasMore` is the fetch's own `has_more`. SE orders a page newest-first
+ * across every post it covers rather than grouping by post, so once the page is
+ * cut short no post in it can be shown to be complete — hence a post that did
+ * receive comments is still reported truncated.
+ */
+function takeComments(items: SeComment[], pageHasMore: boolean): CommentState {
+  const truncated = items.length > MAX_COMMENTS_PER_POST || pageHasMore;
+  return {
+    comments: items.slice(0, MAX_COMMENTS_PER_POST).map(normalizeComment),
+    ...(truncated ? { commentsTruncated: true } : {}),
   };
 }
 
@@ -320,7 +515,38 @@ export class StackExchangeService {
         } catch {
           // Preserve the framework-classified HTTP error when the body is not JSON.
         }
+        // Paging past the keyless depth ceiling. SE answers HTTP 400 — the same
+        // status `bad_parameter` uses — with `error_name: access_denied` and an
+        // `error_id` of 403 in the envelope, so the status cannot separate the
+        // two and `error_name` is what classifies. Scoped to the message SE
+        // sends for the page wall: a revoked or missing key answers
+        // `access_denied` too, and needs a different remedy.
+        if (errObj?.error_name === 'access_denied' && /\bpage\b/i.test(errObj.error_message)) {
+          throw forbidden(`Stack Exchange refused the request: ${errObj.error_message}`, {
+            reason: 'paging_depth_limit',
+            ...ctx.recoveryFor('paging_depth_limit'),
+            error_name: errObj.error_name,
+            error_id: errObj.error_id,
+          });
+        }
         if (errObj?.error_name === 'bad_parameter') {
+          // The configured key, not anything the caller sent. Classified ahead
+          // of the site case and the caller's mapping, both of which would
+          // report a deployment fault as a caller input problem. The message is
+          // fixed rather than built from SE's prose or the configured value —
+          // the key must never reach the wire, and the reason exists to tell an
+          // operator their deployment is misconfigured.
+          if (UNRECOGNIZED_KEY_MESSAGE.test(errObj.error_message)) {
+            throw configurationError(
+              'Stack Exchange did not recognize the API key this server is configured with — STACKEXCHANGE_API_KEY is not a registered Stack Apps key.',
+              {
+                reason: 'invalid_api_key',
+                ...ctx.recoveryFor('invalid_api_key'),
+                error_name: errObj.error_name,
+                error_id: errObj.error_id,
+              },
+            );
+          }
           // SE answers an unknown site with prose ("No site found for name `x`")
           // and every other rejection with the bare name of the field it refused
           // ("ids", "pagesize", "tagged"). Only the first is a site problem;
@@ -348,7 +574,11 @@ export class StackExchangeService {
     try {
       wrapper = JSON.parse(text) as SeWrapper<T>;
     } catch (err) {
-      throw serviceUnavailable('Failed to parse Stack Exchange response', {}, { cause: err });
+      throw serviceUnavailable(
+        'Failed to parse Stack Exchange response',
+        { reason: 'upstream_unavailable', ...ctx.recoveryFor('upstream_unavailable') },
+        { cause: err },
+      );
     }
 
     updateBackoff(wrapper);
@@ -394,6 +624,8 @@ export class StackExchangeService {
           q: opts.query,
           sort,
           pagesize: opts.pageSize ?? 10,
+          page: opts.page,
+          filter: SE_SEARCH_FILTER,
         };
         if (opts.tags && opts.tags.length > 0) {
           params.tagged = opts.tags.join(';');
@@ -497,11 +729,76 @@ export class StackExchangeService {
           return b.score - a.score;
         });
 
+        // Comments, when asked for: exactly two more calls, whatever the answer
+        // count — `/answers/{ids}/comments` batches every fetched answer into one
+        // semicolon-delimited request. Deferred until after the accepted-answer
+        // merge so a merged answer's comments ride the same batch, and skipped
+        // entirely on the not-found path above.
+        let questionComments: CommentState = {};
+        const answerComments = new Map<number, CommentState>();
+
+        if (opts.includeComments) {
+          const commentParams = {
+            site: opts.site,
+            filter: 'withbody',
+            // SE's own default order. Newest-first is what surfaces the
+            // corrections that make an old answer stale; sorting by votes would
+            // resurface the oldest high-vote comments instead.
+            sort: 'creation',
+            order: 'desc',
+            pagesize: COMMENTS_PAGE_SIZE,
+          };
+          const questionCommentsUrl = this.buildUrl(
+            `/questions/${opts.questionId}/comments`,
+            commentParams,
+          );
+          // No answers means no `/answers/{ids}/comments` route to call at all.
+          const answerIds = answers.map((a) => a.answer_id);
+          const answerCommentsUrl =
+            answerIds.length > 0
+              ? this.buildUrl(`/answers/${answerIds.join(';')}/comments`, commentParams)
+              : undefined;
+
+          const [questionCommentsWrapper, answerCommentsWrapper] = await Promise.all([
+            // `ids` here is the question ID the caller supplied, as on the other
+            // /questions routes.
+            this.fetchSe<SeComment>(questionCommentsUrl, ctx, questionIdOrParameter),
+            // Default mapping: `ids` here is the answer ID list SE itself
+            // returned, never the caller's input.
+            answerCommentsUrl
+              ? this.fetchSe<SeComment>(answerCommentsUrl, ctx)
+              : Promise.resolve(undefined),
+          ]);
+
+          questionComments = takeComments(
+            questionCommentsWrapper.items,
+            questionCommentsWrapper.has_more,
+          );
+
+          if (answerCommentsWrapper) {
+            // Keyed on post_id: the combined page is ordered across posts, so
+            // request order says nothing about which answer a comment belongs to.
+            const grouped = Map.groupBy(answerCommentsWrapper.items, (c) => c.post_id);
+            for (const answerId of answerIds) {
+              const own = grouped.get(answerId);
+              if (own) {
+                answerComments.set(answerId, takeComments(own, answerCommentsWrapper.has_more));
+                continue;
+              }
+              // Absent from the page. Only a page SE reported complete proves
+              // the post has none; with more pending, its state is unknown and
+              // stays absent rather than becoming an empty list.
+              answerComments.set(answerId, answerCommentsWrapper.has_more ? {} : { comments: [] });
+            }
+          }
+        }
+
         const normalizedAnswers: NormalizedAnswer[] = answers.map((a) => ({
           answerId: a.answer_id,
           score: a.score,
           isAccepted: a.is_accepted,
           bodyMarkdown: normalizeHtml(a.body ?? ''),
+          ...answerComments.get(a.answer_id),
           ...(a.owner?.display_name
             ? { authorName: decodeHtmlEntities(a.owner.display_name) }
             : {}),
@@ -528,6 +825,7 @@ export class StackExchangeService {
           ...(q.owner?.user_id !== undefined ? { authorUserId: q.owner.user_id } : {}),
           answerCount: q.answer_count,
           answers: normalizedAnswers,
+          ...questionComments,
           ...(q.accepted_answer_id !== undefined ? { acceptedAnswerId: q.accepted_answer_id } : {}),
           ...(q.creation_date !== undefined ? { creationDate: toIsoDate(q.creation_date) } : {}),
           ...(q.last_activity_date !== undefined
@@ -565,6 +863,7 @@ export class StackExchangeService {
         const url = this.buildUrl(`/tags/${encodeURIComponent(opts.tag)}/faq`, {
           site: opts.site,
           pagesize: opts.pageSize ?? 10,
+          page: opts.page,
         });
         const wrapper = await this.fetchSe<SeQuestion>(url, ctx);
 
@@ -683,8 +982,21 @@ export class StackExchangeService {
           ...(s.audience ? { audience: decodeHtmlEntities(s.audience) } : {}),
         });
 
-        const fetchPage = (page: number) =>
-          this.fetchSe<SeSite>(this.buildUrl('/sites', { pagesize: SITES_PAGE_SIZE, page }), ctx);
+        /**
+         * One page of the walk. The quota check sits here rather than on the
+         * result: this is the only method that loops, so an exhausted quota
+         * discovered on page 1 would otherwise be followed by up to nine more
+         * requests that cannot succeed. Checking every page matches what the
+         * single-request methods do with their one response.
+         */
+        const fetchPage = async (page: number) => {
+          const wrapper = await this.fetchSe<SeSite>(
+            this.buildUrl('/sites', { pagesize: SITES_PAGE_SIZE, page }),
+            ctx,
+          );
+          assertQuotaRemaining(wrapper, ctx);
+          return wrapper;
+        };
 
         let wrapper = await fetchPage(1);
         const sites: NormalizedSite[] = wrapper.items.map(normalizeSite);
