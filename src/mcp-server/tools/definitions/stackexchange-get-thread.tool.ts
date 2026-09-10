@@ -30,6 +30,46 @@ function parseQuestionIdOrUrl(input: string): number | null {
   return null;
 }
 
+/**
+ * Per-post comment cap the service applies. Mirrored here so the handler can
+ * report it to the agent alongside the per-post `commentsTruncated` flags.
+ */
+const COMMENTS_CAP = 20;
+
+/** One comment hanging off a question or an answer. */
+const commentSchema = z
+  .object({
+    commentId: z.number().int().describe('Numeric comment ID.'),
+    score: z.number().int().describe('Comment score — comments can score below zero.'),
+    bodyMarkdown: z.string().describe('Comment body normalized from HTML to markdown.'),
+    authorName: z.string().optional().describe('Comment author display name when available.'),
+    authorLink: z.string().optional().describe('Comment author profile URL when available.'),
+    creationDate: z
+      .string()
+      .optional()
+      .describe(
+        'ISO 8601 timestamp of when the comment was posted — the newest comments carry the freshest corrections.',
+      ),
+  })
+  .describe('A single comment with markdown body, score, date, and author attribution.');
+
+/** The comment-bearing half of a post — shared by the question and every answer. */
+type CommentedPost = {
+  comments?: z.infer<typeof commentSchema>[] | undefined;
+  commentsTruncated?: boolean | undefined;
+};
+
+/**
+ * Describe a post's `comments` field. The absent-vs-empty distinction is the
+ * whole point: an empty array means the post has no comments, while an absent
+ * one means the fetch could not establish its state.
+ */
+const commentsDescription = (post: string) =>
+  `Comments on ${post}, newest first, present only when includeComments is true. An empty array means ` +
+  'this post has no comments; an absent array means its comment state is unknown — either comments were ' +
+  'not requested, or the batched fetch was cut short before this post contributed any. Never read an ' +
+  'absent array as "no comments".';
+
 export const stackexchangeGetThread = tool('stackexchange_get_thread', {
   title: 'Get Stack Exchange Q&A Thread',
   description:
@@ -67,6 +107,15 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       .default(10)
       .describe(
         'Maximum number of answers to include (1–100, default 10). Answers are sorted: accepted first, then by score.',
+      ),
+    includeComments: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Fetch the comment thread under the question and under every returned answer (default false). ' +
+          'Comments are where a stale answer usually gets corrected ("this breaks on v3", "use X instead now"), ' +
+          "so set this when the answer's continued accuracy matters. Costs 2 extra API calls against the daily " +
+          'quota regardless of how many answers are returned.',
       ),
   }),
   output: z.object({
@@ -114,6 +163,13 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       .describe(
         'ISO 8601 timestamp of the most recent activity on the question (edit, answer, or comment).',
       ),
+    comments: z.array(commentSchema).optional().describe(commentsDescription('the question')),
+    commentsTruncated: z
+      .boolean()
+      .optional()
+      .describe(
+        "True when the question's comments[] is a partial list — more exist upstream than were returned.",
+      ),
     answers: z
       .array(
         z
@@ -149,6 +205,16 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
               .string()
               .optional()
               .describe('ISO 8601 timestamp of the most recent edit or activity on the answer.'),
+            comments: z
+              .array(commentSchema)
+              .optional()
+              .describe(commentsDescription('this answer')),
+            commentsTruncated: z
+              .boolean()
+              .optional()
+              .describe(
+                "True when this answer's comments[] is a partial list — more exist upstream than were returned.",
+              ),
           })
           .describe(
             'A single Q&A answer with markdown body, score, dates, and author attribution.',
@@ -164,6 +230,12 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     truncated: z.boolean().optional().describe('True when answers were capped at maxAnswers.'),
     shown: z.number().optional().describe('Number of answers returned.'),
     cap: z.number().optional().describe('The maxAnswers cap applied to this request.'),
+    commentsCap: z
+      .number()
+      .optional()
+      .describe(
+        'Maximum comments carried per post — a post at this count reports commentsTruncated.',
+      ),
   },
   enrichmentTrailer: {
     quotaRemaining: { label: 'Quota Remaining' },
@@ -206,6 +278,20 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       recovery:
         'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
     },
+    {
+      reason: 'invalid_api_key',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'Stack Exchange does not recognize the API key this server is configured with.',
+      recovery:
+        'No tool input can fix this — ask the operator to correct STACKEXCHANGE_API_KEY in the server environment.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      recovery:
+        'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -224,11 +310,16 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         questionId,
         site: input.site,
         maxAnswers: input.maxAnswers,
+        includeComments: input.includeComments,
       },
       ctx,
     );
 
-    ctx.enrich({ quotaRemaining, quotaMax });
+    ctx.enrich({
+      quotaRemaining,
+      quotaMax,
+      ...(input.includeComments ? { commentsCap: COMMENTS_CAP } : {}),
+    });
     if (thread.answers.length < thread.answerCount) {
       ctx.enrich.truncated({ shown: thread.answers.length, cap: input.maxAnswers });
     }
@@ -237,6 +328,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       questionId,
       site: input.site,
       answerCount: thread.answers.length,
+      includeComments: input.includeComments,
     });
 
     return thread;
@@ -244,6 +336,51 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
 
   format: (result) => {
     const lines: string[] = [];
+
+    /**
+     * Whether comments were fetched at all. The question's comment route is
+     * single-post, so it always reports that post's own list — a defined
+     * `result.comments` is what separates "not requested" from "requested but
+     * this post contributed nothing to the batched page".
+     */
+    const requested = result.comments !== undefined;
+
+    /**
+     * Render one post's comment block, indented under that post. The unknown
+     * case must never render as the comment-free one: the first is a fact about
+     * the fetch, the second a fact about the post.
+     */
+    const pushComments = (post: CommentedPost): void => {
+      if (!requested) return;
+
+      if (!post.comments) {
+        lines.push('  *Comments unknown — this post received none of the fetched page.*');
+        lines.push('');
+        return;
+      }
+      if (post.comments.length === 0) {
+        lines.push('  *No comments.*');
+        lines.push('');
+        return;
+      }
+
+      lines.push(`  **Comments (${post.comments.length}):**`);
+      for (const c of post.comments) {
+        // Absent author and date are omitted rather than labelled — a deleted
+        // or anonymous commenter is missing data, not a fact to render.
+        const parts = [`**${c.score >= 0 ? '+' : ''}${c.score}**`];
+        if (c.authorName) {
+          parts.push(c.authorLink ? `[${c.authorName}](${c.authorLink})` : c.authorName);
+        }
+        if (c.creationDate) parts.push(c.creationDate);
+        parts.push(`comment ${c.commentId}`);
+        lines.push(`  - ${parts.join(' · ')}: ${c.bodyMarkdown}`);
+      }
+      if (post.commentsTruncated) {
+        lines.push('  *Comment list is partial for this post — more exist upstream.*');
+      }
+      lines.push('');
+    };
 
     // Question header
     lines.push(`# ${result.title}`);
@@ -271,6 +408,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     lines.push('');
     lines.push(result.bodyMarkdown);
     lines.push('');
+    pushComments(result);
 
     // Answers
     if (result.answers.length === 0) {
@@ -298,6 +436,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         lines.push('');
         lines.push(a.bodyMarkdown);
         lines.push('');
+        pushComments(a);
       }
     }
 

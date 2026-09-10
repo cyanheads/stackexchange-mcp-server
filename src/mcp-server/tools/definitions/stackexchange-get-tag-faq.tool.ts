@@ -12,6 +12,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
   description:
     'Fetch the highest-voted answered questions for a tag on a Stack Exchange site — the canonical "best answers in X" list. ' +
     'Returns a question list without bodies; use stackexchange_get_thread to read the full body and answers for any result. ' +
+    'Results past the pageSize cap are reachable with the `page` parameter. ' +
     'Use this tool to find the authoritative community resources on a topic (e.g. tag "javascript" on stackoverflow). ' +
     'Use stackexchange_search_questions for free-text search rather than tag-based browsing.',
   annotations: {
@@ -37,6 +38,16 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       .max(30)
       .default(10)
       .describe('Number of results to return (1–30, default 10).'),
+    page: z
+      .number()
+      .int()
+      .min(1)
+      .default(1)
+      .describe(
+        'Page of results to return, 1-based (default 1). Page 2 with pageSize 10 returns results 11–20. ' +
+          'Each page is a separate upstream call and costs one API quota unit, which matters on the keyless 300/day tier. ' +
+          'Without STACKEXCHANGE_API_KEY, Stack Exchange refuses any page above 25.',
+      ),
   }),
   output: z.object({
     questions: z
@@ -77,6 +88,10 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       .describe('Highest-voted answered questions for the specified tag, ordered by votes.'),
     tag: z.string().describe('Tag name used for this FAQ lookup.'),
     site: z.string().describe('Stack Exchange site api_site_parameter used for this lookup.'),
+    page: z
+      .number()
+      .int()
+      .describe('The 1-based page these results came from — 1 when the input omitted page.'),
     attribution: z
       .string()
       .describe(
@@ -123,6 +138,27 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       recovery:
         'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
     },
+    {
+      reason: 'paging_depth_limit',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'Stack Exchange refused the requested page because paging above page 25 needs a key.',
+      recovery:
+        'Retry with page 25 or lower, or set STACKEXCHANGE_API_KEY to reach pages beyond 25.',
+    },
+    {
+      reason: 'invalid_api_key',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'Stack Exchange does not recognize the API key this server is configured with.',
+      recovery:
+        'No tool input can fix this — ask the operator to correct STACKEXCHANGE_API_KEY in the server environment.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      recovery:
+        'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -132,24 +168,36 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
         tag: input.tag,
         site: input.site,
         pageSize: input.pageSize,
+        page: input.page,
       },
       ctx,
     );
 
     ctx.enrich({ quotaRemaining, quotaMax });
-    if (questions.length >= input.pageSize && hasMore) {
-      ctx.enrich.truncated({ shown: questions.length, cap: input.pageSize });
-    }
 
-    if (questions.length === 0) {
+    // The two notices are mutually exclusive — a filled page cannot be an empty
+    // one — and `truncated()` writes `notice` last-wins, so the branch is what
+    // keeps one from overwriting the other.
+    if (questions.length >= input.pageSize && hasMore) {
+      ctx.enrich.truncated({
+        shown: questions.length,
+        cap: input.pageSize,
+        guidance:
+          `Showing page ${input.page}; Stack Exchange has more results. ` +
+          `Request page ${input.page + 1} with the same tag and pageSize to continue — one API quota unit per page.`,
+      });
+    } else if (questions.length === 0) {
       ctx.enrich.notice(
-        `No FAQ questions found for tag "${input.tag}" on ${input.site}. Verify the tag name or try a different site.`,
+        input.page > 1
+          ? `Page ${input.page} is past the end of the FAQ for tag "${input.tag}" on ${input.site}. Request a lower page.`
+          : `No FAQ questions found for tag "${input.tag}" on ${input.site}. Verify the tag name or try a different site.`,
       );
     }
 
     ctx.log.info('Fetched SE tag FAQ', {
       tag: input.tag,
       site: input.site,
+      page: input.page,
       count: questions.length,
     });
 
@@ -157,13 +205,16 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       questions,
       tag: input.tag,
       site: input.site,
+      page: input.page,
       attribution:
         'Stack Exchange Network — content licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)',
     };
   },
 
   format: (result) => {
-    const lines: string[] = [`## Tag FAQ: \`${result.tag}\` on ${result.site}\n`];
+    const lines: string[] = [
+      `## Tag FAQ: \`${result.tag}\` on ${result.site} — page ${result.page}\n`,
+    ];
     if (result.questions.length === 0) {
       lines.push('No FAQ questions found for this tag.');
       lines.push('');

@@ -135,6 +135,20 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
       recovery:
         'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
     },
+    {
+      reason: 'invalid_api_key',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'Stack Exchange does not recognize the API key this server is configured with.',
+      recovery:
+        'No tool input can fix this — ask the operator to correct STACKEXCHANGE_API_KEY in the server environment.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      recovery:
+        'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
+    },
   ],
 
   async handler(input, ctx) {

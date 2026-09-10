@@ -168,6 +168,7 @@ describe('stackexchangeSearchQuestions format', () => {
   it('renders "No questions found" for empty result', () => {
     const blocks = stackexchangeSearchQuestions.format!({
       questions: [],
+      page: 1,
       attribution: ATTRIBUTION,
     });
     expect(blocks[0]!.type).toBe('text');
@@ -175,7 +176,7 @@ describe('stackexchangeSearchQuestions format', () => {
   });
 
   it('renders question ID and title in output', () => {
-    const output = { questions: [makeQuestion()], attribution: ATTRIBUTION };
+    const output = { questions: [makeQuestion()], page: 1, attribution: ATTRIBUTION };
     const blocks = stackexchangeSearchQuestions.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('11227809');
@@ -183,7 +184,7 @@ describe('stackexchangeSearchQuestions format', () => {
   });
 
   it('renders score, answer count, tags, and link', () => {
-    const output = { questions: [makeQuestion()], attribution: ATTRIBUTION };
+    const output = { questions: [makeQuestion()], page: 1, attribution: ATTRIBUTION };
     const blocks = stackexchangeSearchQuestions.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('28000');
@@ -193,7 +194,7 @@ describe('stackexchangeSearchQuestions format', () => {
   });
 
   it('renders CC BY-SA attribution footer', () => {
-    const output = { questions: [makeQuestion()], attribution: ATTRIBUTION };
+    const output = { questions: [makeQuestion()], page: 1, attribution: ATTRIBUTION };
     const blocks = stackexchangeSearchQuestions.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('CC BY-SA');
@@ -203,6 +204,7 @@ describe('stackexchangeSearchQuestions format', () => {
   it('includes excerpt when present', () => {
     const output = {
       questions: [makeQuestion({ excerpt: 'Branch prediction makes the difference.' })],
+      page: 1,
       attribution: ATTRIBUTION,
     };
     const blocks = stackexchangeSearchQuestions.format!(output);
@@ -211,7 +213,11 @@ describe('stackexchangeSearchQuestions format', () => {
   });
 
   it('omits excerpt gracefully when absent (sparse upstream)', () => {
-    const output = { questions: [makeQuestion({ excerpt: undefined })], attribution: ATTRIBUTION };
+    const output = {
+      questions: [makeQuestion({ excerpt: undefined })],
+      page: 1,
+      attribution: ATTRIBUTION,
+    };
     const blocks = stackexchangeSearchQuestions.format!(output);
     expect(blocks[0]!.type).toBe('text');
     // Should not crash or contain "undefined"
@@ -273,6 +279,7 @@ describe('stackexchangeSearchQuestions dates', () => {
   it('renders both dates in format() alongside the score', () => {
     const blocks = stackexchangeSearchQuestions.format!({
       questions: [makeQuestion()],
+      page: 1,
       attribution: 'CC BY-SA 4.0',
     });
     const text = (blocks[0] as { text: string }).text;
@@ -283,11 +290,174 @@ describe('stackexchangeSearchQuestions dates', () => {
   it('omits the date labels when the question carries neither date', () => {
     const blocks = stackexchangeSearchQuestions.format!({
       questions: [makeQuestion({ creationDate: undefined, lastActivityDate: undefined })],
+      page: 1,
       attribution: 'CC BY-SA 4.0',
     });
     const text = (blocks[0] as { text: string }).text;
     expect(text).not.toContain('Asked:');
     expect(text).not.toContain('Active:');
     expect(text).not.toContain('undefined');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #17 — excerpt reaches both consumption surfaces
+// ---------------------------------------------------------------------------
+describe('stackexchangeSearchQuestions excerpt', () => {
+  const EXCERPT = 'Say I have two async generators and want to merge them.';
+
+  it('carries the excerpt through structuredContent', async () => {
+    mockService(makeSearchResult([makeQuestion({ excerpt: EXCERPT })]));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'async generator' });
+    const result = await stackexchangeSearchQuestions.handler(input, ctx);
+    // Parsed through the tool's own output schema — the framework builds
+    // structuredContent that way, so an undeclared field would be stripped here.
+    const parsed = stackexchangeSearchQuestions.output.parse(result);
+    expect(parsed.questions[0]!.excerpt).toBe(EXCERPT);
+  });
+
+  it('leaves the excerpt absent in structuredContent when the question has none', async () => {
+    mockService(makeSearchResult([makeQuestion({ excerpt: undefined })]));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q' });
+    const result = await stackexchangeSearchQuestions.handler(input, ctx);
+    const parsed = stackexchangeSearchQuestions.output.parse(result);
+    expect(parsed.questions[0]!.excerpt).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #18 — paging
+// ---------------------------------------------------------------------------
+describe('stackexchangeSearchQuestions paging', () => {
+  const fullPage = (size = 5) =>
+    Array.from({ length: size }, (_, i) => makeQuestion({ questionId: 1000 + i }));
+
+  it('defaults page to 1 and forwards it to the service', async () => {
+    const svc = makeSearchResult();
+    mockService(svc);
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q' });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(svc.searchQuestions).toHaveBeenCalledWith(expect.objectContaining({ page: 1 }), ctx);
+  });
+
+  it('forwards an explicit page to the service', async () => {
+    const svc = makeSearchResult();
+    mockService(svc);
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q', page: 4 });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(svc.searchQuestions).toHaveBeenCalledWith(expect.objectContaining({ page: 4 }), ctx);
+  });
+
+  it.each([0, -1, 1.5])('rejects page %s at the schema, before any request', (page) => {
+    expect(() => stackexchangeSearchQuestions.input.parse({ query: 'q', page })).toThrow();
+  });
+
+  it('echoes the effective page in structuredContent when page was omitted', async () => {
+    mockService(makeSearchResult());
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q' });
+    const result = await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(stackexchangeSearchQuestions.output.parse(result).page).toBe(1);
+  });
+
+  it('echoes the effective page in structuredContent when page was supplied', async () => {
+    mockService(makeSearchResult());
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q', page: 7 });
+    const result = await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(stackexchangeSearchQuestions.output.parse(result).page).toBe(7);
+  });
+
+  it('renders the effective page in format()', () => {
+    const blocks = stackexchangeSearchQuestions.format!({
+      questions: [makeQuestion()],
+      page: 3,
+      attribution: ATTRIBUTION,
+    });
+    expect((blocks[0] as { text: string }).text).toContain('3');
+  });
+
+  it('renders the effective page in format() on an empty page', () => {
+    const blocks = stackexchangeSearchQuestions.format!({
+      questions: [],
+      page: 9,
+      attribution: ATTRIBUTION,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('9');
+    expect(text).not.toContain('undefined');
+  });
+
+  it('names paging in the truncation notice rather than only raising the cap', async () => {
+    mockService(makeSearchResult(fullPage(), true));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5, page: 2 });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+
+    const guidance = truncatedSpy.mock.calls[0]![0].guidance;
+    expect(guidance).toBeDefined();
+    // Pre-fix the framework default fired: "Raise the cap or narrow with filters"
+    // — advice that dead-ends at pageSize 30.
+    expect(guidance).not.toContain('Raise the cap');
+    expect(guidance).toContain('page 3');
+  });
+
+  it('emits no paging notice when the upstream reports no more results', async () => {
+    mockService(makeSearchResult(fullPage(), false));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
+    const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5, page: 2 });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(truncatedSpy).not.toHaveBeenCalled();
+    expect(noticeSpy).not.toHaveBeenCalled();
+  });
+
+  it('tells a caller who paged past the end that the page is past the end', async () => {
+    mockService(makeSearchResult([], false));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'generics', page: 12 });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+
+    const notice = noticeSpy.mock.calls[0]![0];
+    expect(notice).toContain('12');
+    // Not the page-1 "try broader terms" advice — the query did match, this page did not.
+    expect(notice).not.toContain('Try broader terms');
+  });
+
+  it('keeps the broaden-the-query advice on an empty first page', async () => {
+    mockService(makeSearchResult([], false));
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'xyzzy-nothing' });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(noticeSpy.mock.calls[0]![0]).toContain('Try broader terms');
+  });
+
+  it('leaves pageSize alone — paging is additive to the cap', async () => {
+    const svc = makeSearchResult();
+    mockService(svc);
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'q', page: 2 });
+    await stackexchangeSearchQuestions.handler(input, ctx);
+    expect(svc.searchQuestions).toHaveBeenCalledWith(
+      expect.objectContaining({ pageSize: 10, page: 2 }),
+      ctx,
+    );
+  });
+
+  it('declares paging_depth_limit as a Forbidden error contract entry', () => {
+    const entry = stackexchangeSearchQuestions.errors?.find(
+      (e) => e.reason === 'paging_depth_limit',
+    );
+    expect(entry).toBeDefined();
+    expect(entry!.recovery).toContain('STACKEXCHANGE_API_KEY');
+    expect(entry!.recovery).toContain('25');
   });
 });

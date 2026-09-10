@@ -12,6 +12,7 @@ import { stackexchangeGetThread } from '@/mcp-server/tools/definitions/stackexch
 import { normalizeHtml } from '@/services/stackexchange/html-normalizer.js';
 import type {
   NormalizedAnswer,
+  NormalizedComment,
   NormalizedThread,
 } from '@/services/stackexchange/stackexchange-service.js';
 
@@ -71,9 +72,26 @@ const makeThread = (overrides: FixtureOverrides<NormalizedThread> = {}): Normali
     ...overrides,
   });
 
+const COMMENTED_ISO = '2024-03-29T11:43:03.000Z';
+
+const makeComment = (overrides: FixtureOverrides<NormalizedComment> = {}): NormalizedComment =>
+  withoutUndefined<NormalizedComment>({
+    commentId: 141067132,
+    score: 7,
+    bodyMarkdown: 'This breaks on `v3` — see [the note](https://example.com/note).',
+    authorName: 'Peter Cordes',
+    authorLink: 'https://stackoverflow.com/users/224132/peter-cordes',
+    creationDate: COMMENTED_ISO,
+    ...overrides,
+  });
+
 const makeThreadResult = (thread = makeThread()) => ({
   getThread: vi.fn().mockResolvedValue({ thread, quotaRemaining: 250, quotaMax: 300 }),
 });
+
+/** The rendered `content[]` surface for one thread. */
+const rendered = (thread: NormalizedThread): string =>
+  (stackexchangeGetThread.format!(thread)[0] as { text: string }).text;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -438,5 +456,279 @@ describe('stackexchangeGetThread dates', () => {
     expect(text).not.toContain('Posted:');
     expect(text).not.toContain('Active:');
     expect(text).not.toContain('undefined');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #20 — opt-in comment fetching
+// ---------------------------------------------------------------------------
+
+describe('stackexchangeGetThread comment opt-in', () => {
+  it('defaults includeComments to false and passes it to the service', async () => {
+    const svc = makeThreadResult();
+    mockService(svc);
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
+
+    expect(input.includeComments).toBe(false);
+    await stackexchangeGetThread.handler(input, ctx);
+    expect(svc.getThread).toHaveBeenCalledWith(
+      expect.objectContaining({ includeComments: false }),
+      ctx,
+    );
+  });
+
+  it('forwards includeComments: true to the service', async () => {
+    const svc = makeThreadResult();
+    mockService(svc);
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const input = stackexchangeGetThread.input.parse({
+      questionIdOrUrl: '11227809',
+      includeComments: true,
+    });
+
+    await stackexchangeGetThread.handler(input, ctx);
+    expect(svc.getThread).toHaveBeenCalledWith(
+      expect.objectContaining({ includeComments: true }),
+      ctx,
+    );
+  });
+
+  it('enriches with the per-post comment cap only when comments were requested', async () => {
+    const withComments = makeThread({
+      comments: [makeComment()],
+      answers: [makeAnswer({ comments: [] })],
+    });
+    mockService(makeThreadResult(withComments));
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const enrichSpy = vi.spyOn(ctx, 'enrich');
+
+    await stackexchangeGetThread.handler(
+      stackexchangeGetThread.input.parse({
+        questionIdOrUrl: '11227809',
+        includeComments: true,
+      }),
+      ctx,
+    );
+
+    expect(enrichSpy).toHaveBeenCalledWith(expect.objectContaining({ commentsCap: 20 }));
+  });
+
+  it('omits the comment cap enrichment on the default path', async () => {
+    mockService(makeThreadResult());
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const enrichSpy = vi.spyOn(ctx, 'enrich');
+
+    await stackexchangeGetThread.handler(
+      stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' }),
+      ctx,
+    );
+
+    for (const call of enrichSpy.mock.calls) {
+      expect(call[0]).not.toHaveProperty('commentsCap');
+    }
+  });
+});
+
+describe('stackexchangeGetThread comments on structuredContent', () => {
+  /**
+   * Parsed through the tool's own output schema — the framework builds
+   * structuredContent that way, so a field the schema does not declare is
+   * stripped here rather than silently surviving a raw handler return.
+   */
+  const structured = async (thread: NormalizedThread) => {
+    mockService(makeThreadResult(thread));
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const result = await stackexchangeGetThread.handler(
+      stackexchangeGetThread.input.parse({
+        questionIdOrUrl: '11227809',
+        includeComments: true,
+      }),
+      ctx,
+    );
+    return stackexchangeGetThread.output.parse(result);
+  };
+
+  it('carries question and answer comments with every declared field', async () => {
+    const parsed = await structured(
+      makeThread({
+        comments: [makeComment({ commentId: 900 })],
+        answers: [makeAnswer({ comments: [makeComment({ commentId: 901, score: -1 })] })],
+      }),
+    );
+
+    expect(parsed.comments?.[0]).toEqual({
+      commentId: 900,
+      score: 7,
+      bodyMarkdown: 'This breaks on `v3` — see [the note](https://example.com/note).',
+      authorName: 'Peter Cordes',
+      authorLink: 'https://stackoverflow.com/users/224132/peter-cordes',
+      creationDate: COMMENTED_ISO,
+    });
+    expect(parsed.answers[0]!.comments?.[0]?.commentId).toBe(901);
+    expect(parsed.answers[0]!.comments?.[0]?.score).toBe(-1);
+  });
+
+  it('keeps a comment-free post as an empty list and a starved post as absent', async () => {
+    const parsed = await structured(
+      makeThread({
+        comments: [],
+        answers: [
+          makeAnswer({ answerId: 1, comments: [makeComment()], commentsTruncated: true }),
+          // Starved by a truncated combined page — state unknown, not none.
+          makeAnswer({ answerId: 2, isAccepted: false, comments: undefined }),
+          makeAnswer({ answerId: 3, isAccepted: false, comments: [] }),
+        ],
+      }),
+    );
+
+    expect(parsed.comments).toEqual([]);
+    expect(parsed.answers[0]!.commentsTruncated).toBe(true);
+    // The load-bearing assertion: the schema must not coerce absent to empty.
+    expect(parsed.answers[1]!.comments).toBeUndefined();
+    expect(parsed.answers[1]!.comments).not.toEqual([]);
+    expect(parsed.answers[2]!.comments).toEqual([]);
+  });
+
+  it('leaves comments absent everywhere on the default path', async () => {
+    mockService(makeThreadResult(makeThread()));
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const result = await stackexchangeGetThread.handler(
+      stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' }),
+      ctx,
+    );
+    const parsed = stackexchangeGetThread.output.parse(result);
+
+    expect(parsed.comments).toBeUndefined();
+    expect(parsed.answers[0]!.comments).toBeUndefined();
+  });
+});
+
+describe('stackexchangeGetThread comments in format()', () => {
+  it('renders question comments and every answer comment under its own post', () => {
+    const text = rendered(
+      makeThread({
+        comments: [makeComment({ commentId: 900, bodyMarkdown: 'A question-level caveat.' })],
+        answers: [
+          makeAnswer({
+            answerId: 11227846,
+            comments: [
+              makeComment({ commentId: 901, bodyMarkdown: 'This breaks on v3.' }),
+              makeComment({ commentId: 902, bodyMarkdown: 'Only works on POSIX.' }),
+            ],
+          }),
+        ],
+      }),
+    );
+
+    expect(text).toContain('A question-level caveat.');
+    expect(text).toContain('This breaks on v3.');
+    expect(text).toContain('Only works on POSIX.');
+    // Attribution and score reach the rendered surface too, not just the JSON one.
+    expect(text).toContain('Peter Cordes');
+    expect(text).toContain(COMMENTED_ISO);
+    // The answer's comments render after its body, not before it.
+    expect(text.indexOf('Branch prediction is the answer.')).toBeLessThan(
+      text.indexOf('This breaks on v3.'),
+    );
+  });
+
+  it('renders a starved post as unknown and never as comment-free', () => {
+    const text = rendered(
+      makeThread({
+        comments: [makeComment()],
+        answerCount: 2,
+        answers: [
+          makeAnswer({ answerId: 1, comments: [makeComment({ bodyMarkdown: 'Present.' })] }),
+          makeAnswer({ answerId: 2, isAccepted: false, comments: undefined }),
+        ],
+      }),
+    );
+
+    // The acceptance criterion: absent must read as unknown on this surface.
+    expect(text).toMatch(/unknown/i);
+    expect(text).not.toMatch(/No comments/i);
+    expect(text).not.toContain('undefined');
+  });
+
+  it('distinguishes a genuinely comment-free post from a starved one in one thread', () => {
+    const text = rendered(
+      makeThread({
+        comments: [],
+        answerCount: 2,
+        answers: [
+          makeAnswer({ answerId: 1, comments: [] }),
+          makeAnswer({ answerId: 2, isAccepted: false, comments: undefined }),
+        ],
+      }),
+    );
+
+    // Both states appear, and they do not read the same.
+    expect(text).toMatch(/No comments/i);
+    expect(text).toMatch(/unknown/i);
+    const noneAt = text.indexOf('### Answer 1');
+    const unknownAt = text.indexOf('### Answer 2');
+    expect(text.slice(noneAt, unknownAt)).toMatch(/No comments/i);
+    expect(text.slice(unknownAt)).toMatch(/unknown/i);
+    expect(text.slice(unknownAt)).not.toMatch(/No comments/i);
+  });
+
+  it('marks a post whose comment list was cut', () => {
+    const text = rendered(
+      makeThread({
+        comments: [makeComment()],
+        answers: [makeAnswer({ comments: [makeComment()], commentsTruncated: true })],
+      }),
+    );
+
+    expect(text).toMatch(/partial/i);
+  });
+
+  it('says nothing about comments at all when they were not requested', () => {
+    const text = rendered(makeThread());
+
+    expect(text).not.toMatch(/Comments/i);
+    expect(text).not.toMatch(/unknown/i);
+    expect(text).not.toContain('undefined');
+  });
+});
+
+describe('stackexchangeGetThread sparse comment rendering', () => {
+  it('omits author and date on a comment that carries neither, without inventing either', () => {
+    const text = rendered(
+      makeThread({
+        comments: [
+          makeComment({
+            commentId: 555,
+            score: -2,
+            bodyMarkdown: 'Deleted-user comment.',
+            authorName: undefined,
+            authorLink: undefined,
+            creationDate: undefined,
+          }),
+        ],
+        answers: [makeAnswer({ comments: [] })],
+      }),
+    );
+
+    expect(text).toContain('Deleted-user comment.');
+    expect(text).toContain('comment 555');
+    // A negative score keeps its sign rather than gaining a spurious '+'.
+    expect(text).toContain('**-2**');
+    expect(text).not.toContain('undefined');
+    // No fabricated stand-in for the missing author.
+    expect(text).not.toMatch(/unknown author|anonymous/i);
+  });
+
+  it('renders a comment name without a profile link as plain text', () => {
+    const text = rendered(
+      makeThread({
+        comments: [makeComment({ authorName: 'Linkless', authorLink: undefined })],
+        answers: [makeAnswer({ comments: [] })],
+      }),
+    );
+
+    expect(text).toContain('Linkless');
+    expect(text).not.toContain('[Linkless](');
   });
 });

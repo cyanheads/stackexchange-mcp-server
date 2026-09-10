@@ -4,6 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
 export const stackexchangeListSites = tool('stackexchange_list_sites', {
@@ -63,6 +64,37 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
     quotaRemaining: { label: 'Quota Remaining' },
     quotaMax: { label: 'Quota Max' },
   },
+
+  errors: [
+    {
+      reason: 'quota_exceeded',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'The Stack Exchange API quota_remaining reached 0 during the site page walk.',
+      recovery:
+        'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
+    },
+    {
+      reason: 'invalid_parameter',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Stack Exchange rejected a parameter of the /sites request and named the field.',
+      recovery:
+        'Retry once — this tool sends no caller-supplied parameter upstream, so no input change fixes it.',
+    },
+    {
+      reason: 'invalid_api_key',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'Stack Exchange does not recognize the API key this server is configured with.',
+      recovery:
+        'No tool input can fix this — ask the operator to correct STACKEXCHANGE_API_KEY in the server environment.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      recovery:
+        'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
+    },
+  ],
 
   async handler(input, ctx) {
     const svc = getStackExchangeService();

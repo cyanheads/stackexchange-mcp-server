@@ -11,8 +11,9 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
   title: 'Search Stack Exchange Questions',
   description:
     'Search questions across a Stack Exchange site. Returns ranked questions with title, score, answer count, ' +
-    'accepted status, tags, ask and last-activity dates, and excerpt — no bodies at this stage. Results supply question_id values for ' +
+    'accepted status, tags, ask and last-activity dates, and a short excerpt of the question body — not the full body. Results supply question_id values for ' +
     'stackexchange_get_thread, which fetches the full question body and all answers. ' +
+    'Results past the pageSize cap are reachable with the `page` parameter. ' +
     'Use the `site` parameter to target a specific community (e.g. "stackoverflow", "superuser", "unix"); ' +
     'call stackexchange_list_sites to discover valid site values.',
   annotations: {
@@ -60,6 +61,16 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       .max(30)
       .default(10)
       .describe('Number of results to return (1–30, default 10).'),
+    page: z
+      .number()
+      .int()
+      .min(1)
+      .default(1)
+      .describe(
+        'Page of results to return, 1-based (default 1). Page 2 with pageSize 10 returns results 11–20. ' +
+          'Each page is a separate upstream call and costs one API quota unit, which matters on the keyless 300/day tier. ' +
+          'Without STACKEXCHANGE_API_KEY, Stack Exchange refuses any page above 25.',
+      ),
   }),
   output: z.object({
     questions: z
@@ -85,7 +96,10 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
             excerpt: z
               .string()
               .optional()
-              .describe('Short text excerpt from the question when available.'),
+              .describe(
+                'Opening prose of the question body, trimmed to roughly 300 characters and ending in "…" when cut. ' +
+                  'Code blocks are omitted; absent when the question body is nothing but code.',
+              ),
             creationDate: z
               .string()
               .optional()
@@ -104,6 +118,10 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
           ),
       )
       .describe('Questions matching the search query, ordered by the specified sort.'),
+    page: z
+      .number()
+      .int()
+      .describe('The 1-based page these results came from — 1 when the input omitted page.'),
     attribution: z
       .string()
       .describe(
@@ -150,6 +168,27 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       recovery:
         'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
     },
+    {
+      reason: 'paging_depth_limit',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'Stack Exchange refused the requested page because paging above page 25 needs a key.',
+      recovery:
+        'Retry with page 25 or lower, or set STACKEXCHANGE_API_KEY to reach pages beyond 25.',
+    },
+    {
+      reason: 'invalid_api_key',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'Stack Exchange does not recognize the API key this server is configured with.',
+      recovery:
+        'No tool input can fix this — ask the operator to correct STACKEXCHANGE_API_KEY in the server environment.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      recovery:
+        'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -164,29 +203,42 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
         ...(input.minScore !== undefined ? { minScore: input.minScore } : {}),
         sort: input.sort,
         pageSize: input.pageSize,
+        page: input.page,
       },
       ctx,
     );
 
     ctx.enrich({ quotaRemaining, quotaMax });
-    if (questions.length >= input.pageSize && hasMore) {
-      ctx.enrich.truncated({ shown: questions.length, cap: input.pageSize });
-    }
 
-    if (questions.length === 0) {
+    // The two notices are mutually exclusive — a filled page cannot be an empty
+    // one — and `truncated()` writes `notice` last-wins, so the branch is what
+    // keeps one from overwriting the other.
+    if (questions.length >= input.pageSize && hasMore) {
+      ctx.enrich.truncated({
+        shown: questions.length,
+        cap: input.pageSize,
+        guidance:
+          `Showing page ${input.page}; Stack Exchange has more results. ` +
+          `Request page ${input.page + 1} with the same query and pageSize to continue — one API quota unit per page.`,
+      });
+    } else if (questions.length === 0) {
       ctx.enrich.notice(
-        `No questions matched "${input.query}" on ${input.site}. Try broader terms, different tags, or a different site.`,
+        input.page > 1
+          ? `Page ${input.page} is past the end of the results for "${input.query}" on ${input.site}. Request a lower page.`
+          : `No questions matched "${input.query}" on ${input.site}. Try broader terms, different tags, or a different site.`,
       );
     }
 
     ctx.log.info('Searched SE questions', {
       query: input.query,
       site: input.site,
+      page: input.page,
       count: questions.length,
     });
 
     return {
       questions,
+      page: input.page,
       attribution:
         'Stack Exchange Network — content licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)',
     };
@@ -194,9 +246,11 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
 
   format: (result) => {
     if (result.questions.length === 0) {
-      return [{ type: 'text', text: 'No questions found for the given query.' }];
+      return [
+        { type: 'text', text: `No questions found for the given query (page ${result.page}).` },
+      ];
     }
-    const lines: string[] = [];
+    const lines: string[] = [`**Page ${result.page}**\n`];
     for (const q of result.questions) {
       lines.push(`## ${q.title}`);
       const stats = [

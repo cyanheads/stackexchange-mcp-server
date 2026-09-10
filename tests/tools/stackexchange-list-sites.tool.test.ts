@@ -25,6 +25,12 @@ const mockService = (service: Partial<ReturnType<typeof getStackExchangeService>
   mockGetService.mockReturnValue(service as ReturnType<typeof getStackExchangeService>);
 };
 
+/**
+ * A mock context bound to the tool's own error contract, so `ctx.fail` and
+ * `ctx.recoveryFor` resolve the reasons stackexchange_list_sites declares.
+ */
+const contractCtx = () => createMockContext({ errors: stackexchangeListSites.errors });
+
 const SITES: NormalizedSite[] = [
   {
     name: 'Stack Overflow',
@@ -65,7 +71,7 @@ beforeEach(() => {
 describe('stackexchangeListSites handler', () => {
   it('returns all sites when no filter is provided', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const input = stackexchangeListSites.input.parse({});
     const result = await stackexchangeListSites.handler(input, ctx);
     expect(result.sites).toHaveLength(4);
@@ -74,7 +80,7 @@ describe('stackexchangeListSites handler', () => {
 
   it('filters sites by name token (case-insensitive)', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const input = stackexchangeListSites.input.parse({ filter: 'stack overflow' });
     const result = await stackexchangeListSites.handler(input, ctx);
     expect(result.sites).toHaveLength(1);
@@ -83,7 +89,7 @@ describe('stackexchangeListSites handler', () => {
 
   it('filters by api_site_parameter token', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const input = stackexchangeListSites.input.parse({ filter: 'superuser' });
     const result = await stackexchangeListSites.handler(input, ctx);
     expect(result.sites.some((s) => s.apiSiteParameter === 'superuser')).toBe(true);
@@ -91,7 +97,7 @@ describe('stackexchangeListSites handler', () => {
 
   it('returns empty sites when no sites match the filter', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const input = stackexchangeListSites.input.parse({ filter: 'xyzzy-does-not-exist' });
     const result = await stackexchangeListSites.handler(input, ctx);
     expect(result.sites).toHaveLength(0);
@@ -100,7 +106,7 @@ describe('stackexchangeListSites handler', () => {
 
   it('ignores whitespace-only filter (treated as no filter)', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const logInfo = vi.spyOn(ctx.log, 'info');
     const input = stackexchangeListSites.input.parse({ filter: '   ' });
     const result = await stackexchangeListSites.handler(input, ctx);
@@ -115,7 +121,7 @@ describe('stackexchangeListSites handler', () => {
 
   it('matches multi-token filter (all tokens must match)', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     // "server fault" — two tokens, only serverfault matches both
     const input = stackexchangeListSites.input.parse({ filter: 'server fault' });
     const result = await stackexchangeListSites.handler(input, ctx);
@@ -125,7 +131,7 @@ describe('stackexchangeListSites handler', () => {
 
   it('returns correct totalCount equal to filtered sites length', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const input = stackexchangeListSites.input.parse({ filter: 'user' });
     const result = await stackexchangeListSites.handler(input, ctx);
     expect(result.totalCount).toBe(result.sites.length);
@@ -133,7 +139,7 @@ describe('stackexchangeListSites handler', () => {
 
   it('calls ctx.enrich.notice when filter returns no results', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
     const input = stackexchangeListSites.input.parse({ filter: 'xyzzy-does-not-exist' });
     await stackexchangeListSites.handler(input, ctx);
@@ -143,7 +149,7 @@ describe('stackexchangeListSites handler', () => {
 
   it('handles sites with no audience field (sparse)', async () => {
     mockService(makeSitesResult());
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const input = stackexchangeListSites.input.parse({ filter: 'askubuntu' });
     const result = await stackexchangeListSites.handler(input, ctx);
     expect(result.sites).toHaveLength(1);
@@ -205,7 +211,7 @@ describe('stackexchangeListSites format', () => {
 describe('stackexchangeListSites truncation notice', () => {
   it('notices that the list is partial when the walk hit its page ceiling', async () => {
     mockService(makeSitesResult(SITES, true));
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
     const input = stackexchangeListSites.input.parse({});
     await stackexchangeListSites.handler(input, ctx);
@@ -215,7 +221,7 @@ describe('stackexchangeListSites truncation notice', () => {
 
   it('stays silent when the walk covered the whole network', async () => {
     mockService(makeSitesResult(SITES, false));
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
     const input = stackexchangeListSites.input.parse({});
     await stackexchangeListSites.handler(input, ctx);
@@ -224,7 +230,7 @@ describe('stackexchangeListSites truncation notice', () => {
 
   it('reports the unmatched filter and the partial list together', async () => {
     mockService(makeSitesResult(SITES, true));
-    const ctx = createMockContext();
+    const ctx = contractCtx();
     const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
     const input = stackexchangeListSites.input.parse({ filter: 'astronomy' });
     await stackexchangeListSites.handler(input, ctx);
