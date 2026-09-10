@@ -29,6 +29,68 @@ import type {
 const BASE_URL = 'https://api.stackexchange.com/2.3';
 const REQUEST_TIMEOUT_MS = 30_000;
 
+/** Page size for the /sites walk — 100 is the SE maximum. */
+const SITES_PAGE_SIZE = 100;
+
+/**
+ * Hard stop for the /sites walk. The network is ~365 sites (4 pages) today; the
+ * ceiling exists so a `has_more` that never clears cannot spin, not to cap the
+ * result — hitting it sets `truncated` so the caller learns the list is partial.
+ */
+const MAX_SITE_PAGES = 10;
+
+/**
+ * Custom filter for /users/{id}. SE's default field set omits `answer_count`
+ * and `question_count`, so the profile call names its fields explicitly.
+ *
+ * Built with `base=none`, so it returns ONLY these fields — every field the
+ * getUser mapping reads must be listed:
+ *   wrapper: .backoff .error_id .error_message .error_name .has_more .items
+ *            .quota_max .quota_remaining
+ *   user:    user_id display_name link reputation badge_counts location
+ *            website_url answer_count question_count creation_date
+ *            last_access_date
+ *   badge_count: gold silver bronze
+ *
+ * Regenerate by re-requesting /filters/create with `base=none` and that
+ * `include` list, then confirm the response's `included_fields` echoes every
+ * one back — SE silently drops a field name that is not on the type.
+ */
+const SE_USER_FILTER = '!fgp_FAe)vSKeMW4GBo(u*a)doNjyqH*B';
+
+/** Convert SE's Unix epoch seconds to an ISO 8601 string. */
+function toIsoDate(epochSeconds: number): string {
+  return new Date(epochSeconds * 1000).toISOString();
+}
+
+/**
+ * How one call site reports a `bad_parameter` rejection that is not about the
+ * site. Stack Exchange names the field it refused (`ids`, `pagesize`, `tagged`)
+ * but `fetchSe` is shared across every tool, so it cannot know what the caller
+ * calls that input or which `reason` the calling tool declares. Each caller
+ * supplies its own mapping instead of the mapper guessing.
+ */
+type BadParameterMapping = (field: string) => { reason: string; message: string };
+
+/** Repeat back the field Stack Exchange refused, without assuming what it is. */
+const invalidParameter: BadParameterMapping = (field) => ({
+  reason: 'invalid_parameter',
+  message: `Stack Exchange rejected the "${field}" parameter.`,
+});
+
+/**
+ * Mapping for the `/questions/{ids}` routes, where SE's `ids` field is the
+ * question ID the caller supplied. Correct only there — every other route
+ * builds `ids` from something the caller never sent.
+ */
+const questionIdOrParameter: BadParameterMapping = (field) =>
+  field === 'ids'
+    ? {
+        reason: 'invalid_id_or_url',
+        message: 'The question ID is not a valid Stack Exchange question ID.',
+      }
+    : invalidParameter(field);
+
 /** Module-level backoff tracking — per-process, acceptable for server-side use. */
 let backoffUntil = 0;
 
@@ -45,6 +107,24 @@ function updateBackoff(wrapper: { backoff?: number }): void {
   if (wrapper.backoff && wrapper.backoff > 0) {
     backoffUntil = Date.now() + wrapper.backoff * 1000;
   }
+}
+
+/**
+ * Raise the calling tool's `quota_exceeded` error once SE reports the daily
+ * quota spent. SE answers HTTP 200 with `quota_remaining: 0` rather than a
+ * rate-limit status, so every domain method checks the envelope itself.
+ */
+function assertQuotaRemaining(
+  wrapper: Pick<SeWrapper<unknown>, 'quota_max' | 'quota_remaining'>,
+  ctx: Context,
+): void {
+  if (wrapper.quota_remaining !== 0) return;
+  throw rateLimited('Stack Exchange API quota exhausted.', {
+    reason: 'quota_exceeded',
+    ...ctx.recoveryFor('quota_exceeded'),
+    quota_remaining: 0,
+    quota_max: wrapper.quota_max,
+  });
 }
 
 export interface SearchQuestionsOptions {
@@ -87,8 +167,12 @@ export interface GetSitesOptions {
 /** Normalized question for tool output. */
 export interface NormalizedQuestion {
   answerCount: number;
+  /** ISO 8601 timestamp of when the question was asked. */
+  creationDate?: string;
   excerpt?: string;
   isAnswered: boolean;
+  /** ISO 8601 timestamp of the question's most recent activity. */
+  lastActivityDate?: string;
   link: string;
   questionId: number;
   score: number;
@@ -104,7 +188,11 @@ export interface NormalizedAnswer {
   authorReputation?: number;
   authorUserId?: number;
   bodyMarkdown: string;
+  /** ISO 8601 timestamp of when the answer was posted. */
+  creationDate?: string;
   isAccepted: boolean;
+  /** ISO 8601 timestamp of the answer's most recent activity. */
+  lastActivityDate?: string;
   score: number;
 }
 
@@ -117,6 +205,10 @@ export interface NormalizedThread {
   authorName?: string;
   authorUserId?: number;
   bodyMarkdown: string;
+  /** ISO 8601 timestamp of when the question was asked. */
+  creationDate?: string;
+  /** ISO 8601 timestamp of the question's most recent activity. */
+  lastActivityDate?: string;
   link: string;
   questionId: number;
   score: number;
@@ -128,7 +220,11 @@ export interface NormalizedThread {
 export interface NormalizedUser {
   answerCount?: number;
   badgeCounts?: { gold?: number; silver?: number; bronze?: number };
+  /** ISO 8601 timestamp of when the account was created. */
+  creationDate?: string;
   displayName: string;
+  /** ISO 8601 timestamp of the user's most recent site access. */
+  lastAccessDate?: string;
   link: string;
   location?: string;
   questionCount?: number;
@@ -144,6 +240,24 @@ export interface NormalizedSite {
   audience?: string;
   name: string;
   siteUrl: string;
+}
+
+/** Map a raw SE question onto the normalized shape shared by search and tag FAQ. */
+function normalizeQuestion(q: SeQuestion): NormalizedQuestion {
+  return {
+    questionId: q.question_id,
+    title: decodeHtmlEntities(q.title),
+    link: q.link,
+    score: q.score,
+    answerCount: q.answer_count,
+    isAnswered: q.is_answered,
+    tags: q.tags,
+    ...(q.excerpt ? { excerpt: decodeHtmlEntities(q.excerpt) } : {}),
+    ...(q.creation_date !== undefined ? { creationDate: toIsoDate(q.creation_date) } : {}),
+    ...(q.last_activity_date !== undefined
+      ? { lastActivityDate: toIsoDate(q.last_activity_date) }
+      : {}),
+  };
 }
 
 export class StackExchangeService {
@@ -172,8 +286,15 @@ export class StackExchangeService {
     return url.toString();
   }
 
-  /** Fetch, decompress (auto), parse, handle errors. */
-  private async fetchSe<T>(url: string, ctx: Context): Promise<SeWrapper<T>> {
+  /**
+   * Fetch, decompress (auto), parse, handle errors. `badParameter` maps a
+   * non-site `bad_parameter` rejection onto the calling tool's own contract.
+   */
+  private async fetchSe<T>(
+    url: string,
+    ctx: Context,
+    badParameter: BadParameterMapping = invalidParameter,
+  ): Promise<SeWrapper<T>> {
     await waitForBackoff();
 
     let response: Response;
@@ -200,15 +321,19 @@ export class StackExchangeService {
           // Preserve the framework-classified HTTP error when the body is not JSON.
         }
         if (errObj?.error_name === 'bad_parameter') {
-          // SE returns error_message "ids" when the IDs field is rejected (e.g. out-of-range integer).
-          // All other bad_parameter responses (site, tags, etc.) map to invalid_site.
-          const reason = errObj.error_message === 'ids' ? 'invalid_id_or_url' : 'invalid_site';
-          const message =
-            reason === 'invalid_id_or_url'
-              ? 'The question ID is not a valid Stack Exchange question ID.'
-              : `Stack Exchange API error: ${errObj.error_message}`;
+          // SE answers an unknown site with prose ("No site found for name `x`")
+          // and every other rejection with the bare name of the field it refused
+          // ("ids", "pagesize", "tagged"). Only the first is a site problem;
+          // the rest go to the caller's mapping so the reported field and the
+          // contract reason belong to the tool that was actually called.
+          const detail = errObj.error_message;
+          const { reason, message } =
+            detail === 'site' || /^no site found/i.test(detail)
+              ? { reason: 'invalid_site', message: `Stack Exchange API error: ${detail}` }
+              : badParameter(detail);
           throw validationError(message, {
             reason,
+            ...ctx.recoveryFor(reason),
             error_name: errObj.error_name,
             error_id: errObj.error_id,
           });
@@ -283,24 +408,9 @@ export class StackExchangeService {
         const url = this.buildUrl('/search/advanced', params);
         const wrapper = await this.fetchSe<SeQuestion>(url, ctx);
 
-        if (wrapper.quota_remaining === 0) {
-          throw rateLimited('Stack Exchange API quota exhausted.', {
-            reason: 'quota_exceeded',
-            quota_remaining: 0,
-            quota_max: wrapper.quota_max,
-          });
-        }
+        assertQuotaRemaining(wrapper, ctx);
 
-        const questions: NormalizedQuestion[] = wrapper.items.map((q) => ({
-          questionId: q.question_id,
-          title: decodeHtmlEntities(q.title),
-          link: q.link,
-          score: q.score,
-          answerCount: q.answer_count,
-          isAnswered: q.is_answered,
-          tags: q.tags,
-          ...(q.excerpt ? { excerpt: decodeHtmlEntities(q.excerpt) } : {}),
-        }));
+        const questions: NormalizedQuestion[] = wrapper.items.map(normalizeQuestion);
 
         return {
           questions,
@@ -341,22 +451,17 @@ export class StackExchangeService {
         });
 
         const [questionWrapper, answersWrapper] = await Promise.all([
-          this.fetchSe<SeQuestion>(questionUrl, ctx),
-          this.fetchSe<SeAnswer>(answersUrl, ctx),
+          this.fetchSe<SeQuestion>(questionUrl, ctx, questionIdOrParameter),
+          this.fetchSe<SeAnswer>(answersUrl, ctx, questionIdOrParameter),
         ]);
 
-        if (questionWrapper.quota_remaining === 0) {
-          throw rateLimited('Stack Exchange API quota exhausted.', {
-            reason: 'quota_exceeded',
-            quota_remaining: 0,
-            quota_max: questionWrapper.quota_max,
-          });
-        }
+        assertQuotaRemaining(questionWrapper, ctx);
 
         const q = questionWrapper.items[0];
         if (!q) {
           throw notFound(`Question ID ${opts.questionId} not found on site "${opts.site}".`, {
             reason: 'question_not_found',
+            ...ctx.recoveryFor('question_not_found'),
             questionId: opts.questionId,
             site: opts.site,
           });
@@ -375,6 +480,8 @@ export class StackExchangeService {
             site: opts.site,
             filter: 'withbody',
           });
+          // Default mapping, not questionIdOrParameter: `ids` on /answers/{id}
+          // is the answer ID SE itself reported, never the caller's input.
           const acceptedWrapper = await this.fetchSe<SeAnswer>(acceptedUrl, ctx);
           const acceptedAnswer = acceptedWrapper.items[0];
           if (acceptedAnswer) {
@@ -401,6 +508,10 @@ export class StackExchangeService {
           ...(a.owner?.link ? { authorLink: a.owner.link } : {}),
           ...(a.owner?.reputation !== undefined ? { authorReputation: a.owner.reputation } : {}),
           ...(a.owner?.user_id !== undefined ? { authorUserId: a.owner.user_id } : {}),
+          ...(a.creation_date !== undefined ? { creationDate: toIsoDate(a.creation_date) } : {}),
+          ...(a.last_activity_date !== undefined
+            ? { lastActivityDate: toIsoDate(a.last_activity_date) }
+            : {}),
         }));
 
         const thread: NormalizedThread = {
@@ -418,6 +529,10 @@ export class StackExchangeService {
           answerCount: q.answer_count,
           answers: normalizedAnswers,
           ...(q.accepted_answer_id !== undefined ? { acceptedAnswerId: q.accepted_answer_id } : {}),
+          ...(q.creation_date !== undefined ? { creationDate: toIsoDate(q.creation_date) } : {}),
+          ...(q.last_activity_date !== undefined
+            ? { lastActivityDate: toIsoDate(q.last_activity_date) }
+            : {}),
         };
 
         return {
@@ -453,23 +568,9 @@ export class StackExchangeService {
         });
         const wrapper = await this.fetchSe<SeQuestion>(url, ctx);
 
-        if (wrapper.quota_remaining === 0) {
-          throw rateLimited('Stack Exchange API quota exhausted.', {
-            reason: 'quota_exceeded',
-            quota_remaining: 0,
-            quota_max: wrapper.quota_max,
-          });
-        }
+        assertQuotaRemaining(wrapper, ctx);
 
-        const questions: NormalizedQuestion[] = wrapper.items.map((q) => ({
-          questionId: q.question_id,
-          title: decodeHtmlEntities(q.title),
-          link: q.link,
-          score: q.score,
-          answerCount: q.answer_count,
-          isAnswered: q.is_answered,
-          tags: q.tags,
-        }));
+        const questions: NormalizedQuestion[] = wrapper.items.map(normalizeQuestion);
 
         return {
           questions,
@@ -498,7 +599,10 @@ export class StackExchangeService {
   }> {
     return withRetry(
       async () => {
-        const profileUrl = this.buildUrl(`/users/${opts.userId}`, { site: opts.site });
+        const profileUrl = this.buildUrl(`/users/${opts.userId}`, {
+          site: opts.site,
+          filter: SE_USER_FILTER,
+        });
         const topTagsUrl = this.buildUrl(`/users/${opts.userId}/top-tags`, {
           site: opts.site,
           pagesize: 10,
@@ -509,18 +613,13 @@ export class StackExchangeService {
           this.fetchSe<SeTopTag>(topTagsUrl, ctx),
         ]);
 
-        if (profileWrapper.quota_remaining === 0) {
-          throw rateLimited('Stack Exchange API quota exhausted.', {
-            reason: 'quota_exceeded',
-            quota_remaining: 0,
-            quota_max: profileWrapper.quota_max,
-          });
-        }
+        assertQuotaRemaining(profileWrapper, ctx);
 
         const u = profileWrapper.items[0];
         if (!u) {
           throw notFound(`User ID ${opts.userId} not found on site "${opts.site}".`, {
             reason: 'user_not_found',
+            ...ctx.recoveryFor('user_not_found'),
             userId: opts.userId,
             site: opts.site,
           });
@@ -542,6 +641,10 @@ export class StackExchangeService {
           topTags,
           ...(u.answer_count !== undefined ? { answerCount: u.answer_count } : {}),
           ...(u.question_count !== undefined ? { questionCount: u.question_count } : {}),
+          ...(u.creation_date !== undefined ? { creationDate: toIsoDate(u.creation_date) } : {}),
+          ...(u.last_access_date !== undefined
+            ? { lastAccessDate: toIsoDate(u.last_access_date) }
+            : {}),
         };
 
         return {
@@ -559,17 +662,19 @@ export class StackExchangeService {
     );
   }
 
-  /** Fetch all sites in the SE network (paginated, bounded set). */
+  /**
+   * Fetch every site in the SE network, walking pages while `has_more` is set.
+   * The walk stops at MAX_SITE_PAGES; `truncated` reports whether SE still had
+   * more to give when it stopped.
+   */
   getSites(ctx: Context): Promise<{
     sites: NormalizedSite[];
     quotaRemaining: number;
     quotaMax: number;
+    truncated: boolean;
   }> {
     return withRetry(
       async () => {
-        const url = this.buildUrl('/sites', { pagesize: 100 });
-        const wrapper = await this.fetchSe<SeSite>(url, ctx);
-
         // SE API returns site names and audiences HTML-encoded (e.g. "Unix &amp; Linux")
         const normalizeSite = (s: SeSite): NormalizedSite => ({
           name: decodeHtmlEntities(s.name),
@@ -578,16 +683,23 @@ export class StackExchangeService {
           ...(s.audience ? { audience: decodeHtmlEntities(s.audience) } : {}),
         });
 
+        const fetchPage = (page: number) =>
+          this.fetchSe<SeSite>(this.buildUrl('/sites', { pagesize: SITES_PAGE_SIZE, page }), ctx);
+
+        let wrapper = await fetchPage(1);
         const sites: NormalizedSite[] = wrapper.items.map(normalizeSite);
 
-        // If there are more pages, fetch them (SE has ~190 sites, fits in 2 pages at pagesize=100)
-        if (wrapper.has_more) {
-          const page2Url = this.buildUrl('/sites', { pagesize: 100, page: 2 });
-          const wrapper2 = await this.fetchSe<SeSite>(page2Url, ctx);
-          sites.push(...wrapper2.items.map(normalizeSite));
+        for (let page = 2; wrapper.has_more && page <= MAX_SITE_PAGES; page++) {
+          wrapper = await fetchPage(page);
+          sites.push(...wrapper.items.map(normalizeSite));
         }
 
-        return { sites, quotaRemaining: wrapper.quota_remaining, quotaMax: wrapper.quota_max };
+        return {
+          sites,
+          quotaRemaining: wrapper.quota_remaining,
+          quotaMax: wrapper.quota_max,
+          truncated: wrapper.has_more,
+        };
       },
       {
         operation: 'getSites',
