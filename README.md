@@ -108,7 +108,7 @@ Stack Exchange-specific:
 - Custom HTML→markdown normalizer covers the full SE post tag set with no external dependencies
 - Backoff tracking: respects the `backoff` field in SE API responses to avoid throttling
 - Quota logging: `quota_remaining` and `quota_max` surfaced via enrichment on every tool call
-- Typed error contracts for `invalid_site`, `question_not_found`, `user_not_found`, `invalid_id_or_url`, and `quota_exceeded`
+- Typed error contracts on every tool — `invalid_site`, `invalid_parameter`, `invalid_api_key`, `invalid_id_or_url`, `invalid_user_id`, `question_not_found`, `user_not_found`, `paging_depth_limit`, `quota_exceeded`, and `upstream_unavailable`
 - Parallel upstream calls in `get_thread` and `get_user` via `Promise.all`
 - Optional `STACKEXCHANGE_API_KEY` lifts the per-IP quota from ~300/day to ~10,000/day with no OAuth required
 

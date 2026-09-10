@@ -6,46 +6,43 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `stackexchange_search_questions` | Search questions across a Stack Exchange site. Returns ranked questions with title, score, answer count, accepted status, tags, and excerpt — no bodies at this stage. Entry point; results supply `question_id` for `stackexchange_get_thread`. | `query` (string), `site` (default `stackoverflow`), `tags` (string[]), `accepted_only` (bool), `min_score` (int), `sort` (enum: relevance\|votes\|activity\|newest), `page_size` (max 30) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `stackexchange_search_questions` | Search questions across a Stack Exchange site. Returns ranked questions with title, score, answer count, accepted status, tags, ask and last-activity dates, and a prose excerpt — no full bodies at this stage. Entry point; results supply `question_id` for `stackexchange_get_thread`. | `query` (string), `site` (default `stackoverflow`), `tags` (string[]), `accepted_only` (bool), `min_score` (int), `sort` (enum: relevance\|votes\|activity\|newest), `page_size` (max 30), `page` (1-based) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `stackexchange_get_thread` | Fetch a complete Q&A thread — question body and all answers, accepted answer first then sorted by score, rendered as clean markdown with fenced code blocks. Accepts an integer question ID or a full Stack Overflow/SE question URL (e.g., `https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster` or `https://stackoverflow.com/questions/11227809/title#answerAnchor` — extract the integer immediately following `/questions/`). The HTML→markdown normalization and the `withbody` filter are baked in; one call replaces fetch-question + fetch-answers + strip-HTML + rank. Attribution (author + link) included per CC BY-SA. | `question_id_or_url` (string), `site` (default `stackoverflow`), `include_comments` (bool, default false), `max_answers` (int, default 10) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `stackexchange_get_tag_faq` | Highest-voted answered questions for a tag on a site — the "canonical answers in X" tool. Maps to `/tags/{tag}/faq`. Returns question list without bodies; use `stackexchange_get_thread` to read any result. | `tag` (string), `site` (default `stackoverflow`), `page_size` (max 30) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `stackexchange_get_tag_faq` | Highest-voted answered questions for a tag on a site — the "canonical answers in X" tool. Maps to `/tags/{tag}/faq`. Returns question list without bodies; use `stackexchange_get_thread` to read any result. | `tag` (string), `site` (default `stackoverflow`), `page_size` (max 30), `page` (1-based) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `stackexchange_get_user` | User profile by ID: reputation, badge counts, top tags by answer score, and account metadata. Credibility context for an answer author. Makes 2 upstream calls: `/users/{id}` (profile) + `/users/{id}/top-tags` (parallelized). | `user_id` (int), `site` (default `stackoverflow`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `stackexchange_list_sites` | Enumerate the Stack Exchange network sites — name, `api_site_parameter`, audience, and URL. Discovery for cross-site search; the `site` param on every other tool comes from `api_site_parameter` here. Results are filtered client-side from a single paged fetch (the network site list is small and bounded). | `filter` (optional string, local name filter) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `stackexchange_list_sites` | Enumerate the Stack Exchange network sites — name, `api_site_parameter`, audience, and URL. Discovery for cross-site search; the `site` param on every other tool comes from `api_site_parameter` here. Results are filtered client-side from a bounded page walk — the walk stops at a page ceiling and reports `truncated` when SE still had more to give. | `filter` (optional string, local name filter) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 
 ### Tool Error Contracts
 
-Typed contracts for domain-specific failures. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`) bubble freely and aren't listed.
+Typed contracts for domain-specific failures. Every tool declares one, so a caller can branch on `data.reason` and read `data.recovery.hint` on any failure. Baseline codes (`InternalError`, `Timeout`) bubble freely and aren't listed.
 
-**`stackexchange_search_questions`**
-
-| reason | code | when | retryable |
-|:-------|:-----|:-----|:----------|
-| `invalid_site` | `InvalidParams` | SE returns `error_name: "bad_parameter"` for unknown `site` value | No — fix the `site` value; use `stackexchange_list_sites` to discover valid values |
-| `quota_exceeded` | `ServiceUnavailable` | `quota_remaining` reaches 0 | No — quota resets at midnight UTC; supply `STACKEXCHANGE_API_KEY` to lift to 10 k/day |
-
-**`stackexchange_get_thread`**
+Four reasons are shared, because they arise in `fetchSe` rather than in any one tool:
 
 | reason | code | when | retryable |
 |:-------|:-----|:-----|:----------|
-| `question_not_found` | `NotFound` | `items[]` is empty (HTTP 200 with no items — SE does NOT return 400 for a missing question ID) | No — verify the ID or re-run a search |
-| `invalid_site` | `InvalidParams` | SE returns `error_name: "bad_parameter"` for unknown `site` value | No — fix the `site` value |
-| `invalid_id_or_url` | `InvalidParams` | Input is not a parseable integer ID and not a recognizable SE question URL | No — provide a numeric question ID or a valid URL |
-| `quota_exceeded` | `ServiceUnavailable` | `quota_remaining` reaches 0 | No — quota resets at midnight UTC |
+| `invalid_site` | `ValidationError` | SE answers a bad `site` with prose — `No site found for name \`x\`` | No — use `stackexchange_list_sites` to discover valid values |
+| `invalid_parameter` | `ValidationError` | SE rejects a request parameter and names the bare field (`pagesize`, `tagged`) | No — correct the named parameter |
+| `invalid_api_key` | `ConfigurationError` | SE does not recognize the key the server is configured with | No — no tool input fixes it; an operator corrects `STACKEXCHANGE_API_KEY` |
+| `upstream_unavailable` | `ServiceUnavailable` | SE answers with a body that is not the expected JSON envelope | Yes — SE is degraded; retry in a few minutes |
 
-**`stackexchange_get_tag_faq`**
+All four arrive on HTTP 400, so `error_name` and message shape do the classifying, not the status. Note that SE's envelope carries its own `error_id` — a `403` there is not an HTTP 403.
 
-| reason | code | when | retryable |
-|:-------|:-----|:-----|:----------|
-| `invalid_site` | `InvalidParams` | SE returns `error_name: "bad_parameter"` for unknown `site` value | No — fix the `site` value |
-| `quota_exceeded` | `ServiceUnavailable` | `quota_remaining` reaches 0 | No — quota resets at midnight UTC |
+Every tool also declares `quota_exceeded` (`RateLimited`) when `quota_remaining` reaches 0. Not retryable within the day; quota resets at midnight UTC, and `STACKEXCHANGE_API_KEY` lifts the ceiling to ~10,000/day.
 
-**`stackexchange_get_user`**
+Per-tool reasons on top of those:
 
-| reason | code | when | retryable |
-|:-------|:-----|:-----|:----------|
-| `user_not_found` | `NotFound` | `/users/{id}` returns `items[]` empty (HTTP 200 — same empty-items pattern as questions) | No — verify the user ID |
-| `invalid_site` | `InvalidParams` | SE returns `error_name: "bad_parameter"` for unknown `site` value | No — fix the `site` value |
-| `quota_exceeded` | `ServiceUnavailable` | `quota_remaining` reaches 0 | No — quota resets at midnight UTC |
+| tool | reason | code | when |
+|:-----|:-------|:-----|:-----|
+| `stackexchange_search_questions` | `paging_depth_limit` | `Forbidden` | `page` above 25 without a key — SE answers `error_name: "access_denied"` |
+| `stackexchange_get_tag_faq` | `paging_depth_limit` | `Forbidden` | same, on `/tags/{tag}/faq` |
+| `stackexchange_get_thread` | `question_not_found` | `NotFound` | `items[]` empty — SE answers HTTP 200 with no items rather than 404 |
+| `stackexchange_get_thread` | `invalid_id_or_url` | `ValidationError` | Input is neither a parseable integer ID nor a recognizable SE question URL |
+| `stackexchange_get_user` | `user_not_found` | `NotFound` | Same empty-items pattern as questions |
+| `stackexchange_get_user` | `invalid_user_id` | `ValidationError` | `userId` above 2147483647 — SE user IDs are 32-bit signed integers |
+
+`stackexchange_list_sites` declares only the shared set: `/sites` takes no `site` parameter, and its page walk stops at page 10, well under the keyless page-25 wall.
+
+The upper bound on `userId` is enforced in the handler rather than on the input schema deliberately. A schema rejection never reaches `errors[]` — the handler does not run — so it would arrive as a generic `InvalidParams` with no reason and no recovery hint.
 
 ### Resources
 
