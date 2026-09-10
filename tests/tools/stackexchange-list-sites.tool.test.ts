@@ -51,8 +51,8 @@ const SITES: NormalizedSite[] = [
   },
 ];
 
-const makeSitesResult = (sites = SITES) => ({
-  getSites: vi.fn().mockResolvedValue({ sites, quotaRemaining: 250, quotaMax: 300 }),
+const makeSitesResult = (sites = SITES, truncated = false) => ({
+  getSites: vi.fn().mockResolvedValue({ sites, quotaRemaining: 250, quotaMax: 300, truncated }),
 });
 
 beforeEach(() => {
@@ -101,10 +101,16 @@ describe('stackexchangeListSites handler', () => {
   it('ignores whitespace-only filter (treated as no filter)', async () => {
     mockService(makeSitesResult());
     const ctx = createMockContext();
+    const logInfo = vi.spyOn(ctx.log, 'info');
     const input = stackexchangeListSites.input.parse({ filter: '   ' });
     const result = await stackexchangeListSites.handler(input, ctx);
     // Whitespace-only → all sites returned
     expect(result.sites).toHaveLength(4);
+    // ...and the call is not reported as a filtered one, since nothing narrowed.
+    expect(logInfo).toHaveBeenCalledWith(
+      'Listed SE sites',
+      expect.objectContaining({ filtered: false, total: 4 }),
+    );
   });
 
   it('matches multi-token filter (all tokens must match)', async () => {
@@ -190,5 +196,41 @@ describe('stackexchangeListSites format', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('1 site');
     expect(text).not.toContain('1 sites');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Truncation signalling
+// ---------------------------------------------------------------------------
+describe('stackexchangeListSites truncation notice', () => {
+  it('notices that the list is partial when the walk hit its page ceiling', async () => {
+    mockService(makeSitesResult(SITES, true));
+    const ctx = createMockContext();
+    const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
+    const input = stackexchangeListSites.input.parse({});
+    await stackexchangeListSites.handler(input, ctx);
+    expect(noticeSpy).toHaveBeenCalledOnce();
+    expect(noticeSpy.mock.calls[0]![0]).toContain('partial');
+  });
+
+  it('stays silent when the walk covered the whole network', async () => {
+    mockService(makeSitesResult(SITES, false));
+    const ctx = createMockContext();
+    const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
+    const input = stackexchangeListSites.input.parse({});
+    await stackexchangeListSites.handler(input, ctx);
+    expect(noticeSpy).not.toHaveBeenCalled();
+  });
+
+  it('reports the unmatched filter and the partial list together', async () => {
+    mockService(makeSitesResult(SITES, true));
+    const ctx = createMockContext();
+    const noticeSpy = vi.spyOn(ctx.enrich, 'notice');
+    const input = stackexchangeListSites.input.parse({ filter: 'astronomy' });
+    await stackexchangeListSites.handler(input, ctx);
+    expect(noticeSpy).toHaveBeenCalledOnce();
+    const notice = noticeSpy.mock.calls[0]![0] as string;
+    expect(notice).toContain('astronomy');
+    expect(notice).toContain('partial');
   });
 });

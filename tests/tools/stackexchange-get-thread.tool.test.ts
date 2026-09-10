@@ -35,6 +35,10 @@ type FixtureOverrides<T> = { [K in keyof T]?: T[K] | undefined };
 const withoutUndefined = <T extends object>(value: FixtureOverrides<T>): T =>
   Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
 
+const CREATED_ISO = '2012-06-27T12:51:36.000Z';
+const ACTIVE_ISO = '2025-08-12T12:00:00.000Z';
+const ANSWERED_ISO = '2023-07-22T04:26:40.000Z';
+
 const makeAnswer = (overrides: FixtureOverrides<NormalizedAnswer> = {}): NormalizedAnswer =>
   withoutUndefined<NormalizedAnswer>({
     answerId: 11227846,
@@ -44,6 +48,8 @@ const makeAnswer = (overrides: FixtureOverrides<NormalizedAnswer> = {}): Normali
     authorName: 'JUser',
     authorLink: 'https://stackoverflow.com/users/1/juser',
     authorReputation: 120000,
+    creationDate: ANSWERED_ISO,
+    lastActivityDate: ACTIVE_ISO,
     ...overrides,
   });
 
@@ -60,6 +66,8 @@ const makeThread = (overrides: FixtureOverrides<NormalizedThread> = {}): Normali
     acceptedAnswerId: 11227846,
     answerCount: 1,
     answers: [makeAnswer()],
+    creationDate: CREATED_ISO,
+    lastActivityDate: ACTIVE_ISO,
     ...overrides,
   });
 
@@ -374,5 +382,61 @@ describe('stackexchangeGetThread format of normalized bodies', () => {
     expect(text).toContain('Use the <div> element.');
     expect(text).toContain('- outer\n  - inner');
     expect(text).toContain('| Method | Time |\n| --- | --- |\n| sorted | 1.93s |');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Date surfacing
+// ---------------------------------------------------------------------------
+describe('stackexchangeGetThread dates', () => {
+  it('carries ISO 8601 dates for the question and every answer through structuredContent', async () => {
+    mockService(
+      makeThreadResult(
+        makeThread({
+          answerCount: 2,
+          answers: [makeAnswer(), makeAnswer({ answerId: 2, isAccepted: false })],
+        }),
+      ),
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const input = stackexchangeGetThread.input.parse({ questionIdOrUrl: '11227809' });
+    const result = await stackexchangeGetThread.handler(input, ctx);
+    // Parsed through the tool's own output schema — the framework builds
+    // structuredContent that way, so an undeclared field would be stripped here.
+    const parsed = stackexchangeGetThread.output.parse(result);
+    expect(parsed.creationDate).toBe(CREATED_ISO);
+    expect(parsed.lastActivityDate).toBe(ACTIVE_ISO);
+    expect(parsed.answers[0]!.creationDate).toBe(ANSWERED_ISO);
+    expect(parsed.answers[1]!.creationDate).toBe(ANSWERED_ISO);
+    expect(parsed.answers[1]!.lastActivityDate).toBe(ACTIVE_ISO);
+  });
+
+  it('renders the question dates and every answer date in format()', () => {
+    const thread = makeThread({
+      answerCount: 2,
+      answers: [
+        makeAnswer(),
+        makeAnswer({ answerId: 2, isAccepted: false, creationDate: '2023-11-14T22:13:20.000Z' }),
+      ],
+    });
+    const text = (stackexchangeGetThread.format!(thread)[0] as { text: string }).text;
+    expect(text).toContain(`**Asked:** ${CREATED_ISO}`);
+    expect(text).toContain(`**Active:** ${ACTIVE_ISO}`);
+    expect(text).toContain(`**Posted:** ${ANSWERED_ISO}`);
+    // The second answer's own date renders too — not just the first one's.
+    expect(text).toContain('**Posted:** 2023-11-14T22:13:20.000Z');
+  });
+
+  it('omits the date labels when neither the question nor its answer is dated', () => {
+    const thread = makeThread({
+      creationDate: undefined,
+      lastActivityDate: undefined,
+      answers: [makeAnswer({ creationDate: undefined, lastActivityDate: undefined })],
+    });
+    const text = (stackexchangeGetThread.format!(thread)[0] as { text: string }).text;
+    expect(text).not.toContain('Asked:');
+    expect(text).not.toContain('Posted:');
+    expect(text).not.toContain('Active:');
+    expect(text).not.toContain('undefined');
   });
 });

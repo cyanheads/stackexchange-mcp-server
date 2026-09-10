@@ -59,8 +59,20 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
             tags: z
               .array(z.string().describe('A tag applied to this question.'))
               .describe('Tags applied to this question.'),
+            creationDate: z
+              .string()
+              .optional()
+              .describe(
+                'ISO 8601 timestamp of when the question was asked — use it to judge whether the advice is still current.',
+              ),
+            lastActivityDate: z
+              .string()
+              .optional()
+              .describe(
+                'ISO 8601 timestamp of the most recent activity on the question (edit, answer, or comment).',
+              ),
           })
-          .describe('A Stack Exchange FAQ question with score, answer count, and tags.'),
+          .describe('A Stack Exchange FAQ question with score, answer count, tags, and dates.'),
       )
       .describe('Highest-voted answered questions for the specified tag, ordered by votes.'),
     tag: z.string().describe('Tag name used for this FAQ lookup.'),
@@ -96,6 +108,13 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
         'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',
+    },
+    {
+      reason: 'invalid_parameter',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Stack Exchange rejected a request parameter and named the field rather than reporting a bad site.',
+      recovery:
+        'Correct the parameter named in the error message — tag must be an exact tag name and pageSize must be 1–30.',
     },
     {
       reason: 'quota_exceeded',
@@ -153,9 +172,15 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     }
     for (const q of result.questions) {
       lines.push(`### ${q.title}`);
-      lines.push(
-        `**ID:** ${q.questionId} | **Score:** ${q.score} | **Answers:** ${q.answerCount} | **Answered:** ${q.isAnswered ? 'Yes' : 'No'}`,
-      );
+      const stats = [
+        `**ID:** ${q.questionId}`,
+        `**Score:** ${q.score}`,
+        `**Answers:** ${q.answerCount}`,
+        `**Answered:** ${q.isAnswered ? 'Yes' : 'No'}`,
+      ];
+      if (q.creationDate) stats.push(`**Asked:** ${q.creationDate}`);
+      if (q.lastActivityDate) stats.push(`**Active:** ${q.lastActivityDate}`);
+      lines.push(stats.join(' | '));
       lines.push(`**Tags:** ${q.tags.join(', ')}`);
       lines.push(`**Link:** ${q.link}`);
       lines.push('');

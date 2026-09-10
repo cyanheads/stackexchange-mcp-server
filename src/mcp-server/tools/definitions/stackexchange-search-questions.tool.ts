@@ -11,7 +11,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
   title: 'Search Stack Exchange Questions',
   description:
     'Search questions across a Stack Exchange site. Returns ranked questions with title, score, answer count, ' +
-    'accepted status, tags, and excerpt — no bodies at this stage. Results supply question_id values for ' +
+    'accepted status, tags, ask and last-activity dates, and excerpt — no bodies at this stage. Results supply question_id values for ' +
     'stackexchange_get_thread, which fetches the full question body and all answers. ' +
     'Use the `site` parameter to target a specific community (e.g. "stackoverflow", "superuser", "unix"); ' +
     'call stackexchange_list_sites to discover valid site values.',
@@ -86,9 +86,21 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
               .string()
               .optional()
               .describe('Short text excerpt from the question when available.'),
+            creationDate: z
+              .string()
+              .optional()
+              .describe(
+                'ISO 8601 timestamp of when the question was asked — use it to judge whether the advice is still current.',
+              ),
+            lastActivityDate: z
+              .string()
+              .optional()
+              .describe(
+                'ISO 8601 timestamp of the most recent activity on the question (edit, answer, or comment).',
+              ),
           })
           .describe(
-            'A Stack Exchange question with score, answer count, tags, and optional excerpt.',
+            'A Stack Exchange question with score, answer count, tags, dates, and optional excerpt.',
           ),
       )
       .describe('Questions matching the search query, ordered by the specified sort.'),
@@ -123,6 +135,13 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
         'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',
+    },
+    {
+      reason: 'invalid_parameter',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Stack Exchange rejected a request parameter and named the field rather than reporting a bad site.',
+      recovery:
+        'Correct the parameter named in the error message — tags must be exact tag names and pageSize must be 1–30.',
     },
     {
       reason: 'quota_exceeded',
@@ -180,9 +199,15 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
     const lines: string[] = [];
     for (const q of result.questions) {
       lines.push(`## ${q.title}`);
-      lines.push(
-        `**ID:** ${q.questionId} | **Score:** ${q.score} | **Answers:** ${q.answerCount} | **Answered:** ${q.isAnswered ? 'Yes' : 'No'}`,
-      );
+      const stats = [
+        `**ID:** ${q.questionId}`,
+        `**Score:** ${q.score}`,
+        `**Answers:** ${q.answerCount}`,
+        `**Answered:** ${q.isAnswered ? 'Yes' : 'No'}`,
+      ];
+      if (q.creationDate) stats.push(`**Asked:** ${q.creationDate}`);
+      if (q.lastActivityDate) stats.push(`**Active:** ${q.lastActivityDate}`);
+      lines.push(stats.join(' | '));
       lines.push(`**Tags:** ${q.tags.join(', ')}`);
       lines.push(`**Link:** ${q.link}`);
       if (q.excerpt) lines.push(`\n${q.excerpt}`);

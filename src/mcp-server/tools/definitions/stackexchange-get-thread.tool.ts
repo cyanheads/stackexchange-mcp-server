@@ -102,6 +102,18 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       .int()
       .optional()
       .describe('ID of the accepted answer when one exists.'),
+    creationDate: z
+      .string()
+      .optional()
+      .describe(
+        'ISO 8601 timestamp of when the question was asked — use it to judge whether the advice is still current.',
+      ),
+    lastActivityDate: z
+      .string()
+      .optional()
+      .describe(
+        'ISO 8601 timestamp of the most recent activity on the question (edit, answer, or comment).',
+      ),
     answers: z
       .array(
         z
@@ -127,8 +139,20 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
               .describe(
                 'Answer author numeric user ID when available — pass to stackexchange_get_user to fetch the full profile.',
               ),
+            creationDate: z
+              .string()
+              .optional()
+              .describe(
+                'ISO 8601 timestamp of when the answer was posted — an old answer may predate the current API.',
+              ),
+            lastActivityDate: z
+              .string()
+              .optional()
+              .describe('ISO 8601 timestamp of the most recent edit or activity on the answer.'),
           })
-          .describe('A single Q&A answer with markdown body, score, and author attribution.'),
+          .describe(
+            'A single Q&A answer with markdown body, score, dates, and author attribution.',
+          ),
       )
       .describe('Answers sorted: accepted answer first, then by score descending.'),
   }),
@@ -167,6 +191,13 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       when: 'The input is not a parseable integer ID and not a recognizable SE question URL.',
       recovery:
         'Provide a numeric question ID (e.g. "11227809") or a valid Stack Exchange question URL.',
+    },
+    {
+      reason: 'invalid_parameter',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Stack Exchange rejected a request parameter other than the question ID, and named the field.',
+      recovery:
+        'Correct the parameter named in the error message — maxAnswers must be 1–100 and site must match the question.',
     },
     {
       reason: 'quota_exceeded',
@@ -218,6 +249,8 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     lines.push(`# ${result.title}`);
     const statParts = [`**Question ID:** ${result.questionId}`, `**Score:** ${result.score}`];
     if (result.answerCount != null) statParts.push(`**Answers:** ${result.answerCount}`);
+    if (result.creationDate) statParts.push(`**Asked:** ${result.creationDate}`);
+    if (result.lastActivityDate) statParts.push(`**Active:** ${result.lastActivityDate}`);
     lines.push(statParts.join(' | '));
     lines.push(`**Tags:** ${result.tags.join(', ')}`);
     lines.push(`**Link:** ${result.link}`);
@@ -251,6 +284,8 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
 
         // Attribution per CC BY-SA 4.0
         const attrParts: string[] = [`**Score:** ${a.score}`];
+        if (a.creationDate) attrParts.push(`**Posted:** ${a.creationDate}`);
+        if (a.lastActivityDate) attrParts.push(`**Active:** ${a.lastActivityDate}`);
         if (a.authorName) {
           const authorRef = a.authorLink ? `[${a.authorName}](${a.authorLink})` : a.authorName;
           const userIdSuffix = a.authorUserId != null ? ` (user_id: ${a.authorUserId})` : '';

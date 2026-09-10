@@ -28,6 +28,9 @@ type FixtureOverrides<T> = { [K in keyof T]?: T[K] | undefined };
 const withoutUndefined = <T extends object>(value: FixtureOverrides<T>): T =>
   Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
 
+const CREATED_ISO = '2012-06-27T12:51:36.000Z';
+const ACTIVE_ISO = '2025-08-12T12:00:00.000Z';
+
 const makeQuestion = (overrides: FixtureOverrides<NormalizedQuestion> = {}): NormalizedQuestion =>
   withoutUndefined<NormalizedQuestion>({
     questionId: 11227809,
@@ -37,6 +40,8 @@ const makeQuestion = (overrides: FixtureOverrides<NormalizedQuestion> = {}): Nor
     answerCount: 27,
     isAnswered: true,
     tags: ['java', 'c++', 'performance', 'sorting'],
+    creationDate: CREATED_ISO,
+    lastActivityDate: ACTIVE_ISO,
     ...overrides,
   });
 
@@ -246,5 +251,43 @@ describe('stackexchangeSearchQuestions truncation enrichment', () => {
     const input = stackexchangeSearchQuestions.input.parse({ query: 'q', pageSize: 5 });
     await stackexchangeSearchQuestions.handler(input, ctx);
     expect(truncatedSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Date surfacing
+// ---------------------------------------------------------------------------
+describe('stackexchangeSearchQuestions dates', () => {
+  it('carries ISO 8601 question dates through structuredContent', async () => {
+    mockService(makeSearchResult());
+    const ctx = createMockContext({ errors: stackexchangeSearchQuestions.errors });
+    const input = stackexchangeSearchQuestions.input.parse({ query: 'sorted array' });
+    const result = await stackexchangeSearchQuestions.handler(input, ctx);
+    // Parsed through the tool's own output schema — the framework builds
+    // structuredContent that way, so an undeclared field would be stripped here.
+    const parsed = stackexchangeSearchQuestions.output.parse(result);
+    expect(parsed.questions[0]!.creationDate).toBe(CREATED_ISO);
+    expect(parsed.questions[0]!.lastActivityDate).toBe(ACTIVE_ISO);
+  });
+
+  it('renders both dates in format() alongside the score', () => {
+    const blocks = stackexchangeSearchQuestions.format!({
+      questions: [makeQuestion()],
+      attribution: 'CC BY-SA 4.0',
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain(`**Asked:** ${CREATED_ISO}`);
+    expect(text).toContain(`**Active:** ${ACTIVE_ISO}`);
+  });
+
+  it('omits the date labels when the question carries neither date', () => {
+    const blocks = stackexchangeSearchQuestions.format!({
+      questions: [makeQuestion({ creationDate: undefined, lastActivityDate: undefined })],
+      attribution: 'CC BY-SA 4.0',
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Asked:');
+    expect(text).not.toContain('Active:');
+    expect(text).not.toContain('undefined');
   });
 });

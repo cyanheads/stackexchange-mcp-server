@@ -25,6 +25,9 @@ const mockService = (service: Partial<ReturnType<typeof getStackExchangeService>
   mockGetService.mockReturnValue(service as ReturnType<typeof getStackExchangeService>);
 };
 
+const CREATED_ISO = '2012-06-27T12:51:36.000Z';
+const ACTIVE_ISO = '2025-08-12T12:00:00.000Z';
+
 const makeFaqQuestion = (overrides: Partial<NormalizedQuestion> = {}): NormalizedQuestion => ({
   questionId: 11227809,
   title: 'Why is processing a sorted array faster than processing an unsorted array?',
@@ -33,7 +36,20 @@ const makeFaqQuestion = (overrides: Partial<NormalizedQuestion> = {}): Normalize
   answerCount: 27,
   isAnswered: true,
   tags: ['java', 'c++', 'performance'],
+  creationDate: CREATED_ISO,
+  lastActivityDate: ACTIVE_ISO,
   ...overrides,
+});
+
+/** A question with no upstream timestamps — the sparse-payload shape. */
+const undatedFaqQuestion = (): NormalizedQuestion => ({
+  questionId: 99,
+  title: 'Undated question',
+  link: 'https://stackoverflow.com/questions/99',
+  score: 1,
+  answerCount: 0,
+  isAnswered: false,
+  tags: ['c'],
 });
 
 const makeFaqResult = (questions: NormalizedQuestion[] = [makeFaqQuestion()], hasMore = false) => ({
@@ -226,5 +242,47 @@ describe('stackexchangeGetTagFaq truncation enrichment', () => {
     const input = stackexchangeGetTagFaq.input.parse({ tag: 'java', pageSize: 5 });
     await stackexchangeGetTagFaq.handler(input, ctx);
     expect(truncatedSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Date surfacing
+// ---------------------------------------------------------------------------
+describe('stackexchangeGetTagFaq dates', () => {
+  it('carries ISO 8601 question dates through structuredContent', async () => {
+    mockService(makeFaqResult());
+    const ctx = createMockContext({ errors: stackexchangeGetTagFaq.errors });
+    const input = stackexchangeGetTagFaq.input.parse({ tag: 'java' });
+    const result = await stackexchangeGetTagFaq.handler(input, ctx);
+    // Parsed through the tool's own output schema — the framework builds
+    // structuredContent that way, so an undeclared field would be stripped here.
+    const parsed = stackexchangeGetTagFaq.output.parse(result);
+    expect(parsed.questions[0]!.creationDate).toBe(CREATED_ISO);
+    expect(parsed.questions[0]!.lastActivityDate).toBe(ACTIVE_ISO);
+  });
+
+  it('renders both dates in format() alongside the score', () => {
+    const blocks = stackexchangeGetTagFaq.format!({
+      questions: [makeFaqQuestion()],
+      tag: 'java',
+      site: 'stackoverflow',
+      attribution: ATTRIBUTION,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain(`**Asked:** ${CREATED_ISO}`);
+    expect(text).toContain(`**Active:** ${ACTIVE_ISO}`);
+  });
+
+  it('omits the date labels when the question carries neither date', () => {
+    const blocks = stackexchangeGetTagFaq.format!({
+      questions: [undatedFaqQuestion()],
+      tag: 'c',
+      site: 'stackoverflow',
+      attribution: ATTRIBUTION,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Asked:');
+    expect(text).not.toContain('Active:');
+    expect(text).not.toContain('undefined');
   });
 });

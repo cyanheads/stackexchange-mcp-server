@@ -31,6 +31,9 @@ type FixtureOverrides<T> = { [K in keyof T]?: T[K] | undefined };
 const withoutUndefined = <T extends object>(value: FixtureOverrides<T>): T =>
   Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
 
+const CREATED_ISO = '2008-09-26T12:05:05.000Z';
+const LAST_ACCESS_ISO = '2026-09-09T19:54:05.000Z';
+
 const makeUser = (overrides: FixtureOverrides<NormalizedUser> = {}): NormalizedUser =>
   withoutUndefined<NormalizedUser>({
     userId: 1,
@@ -42,6 +45,8 @@ const makeUser = (overrides: FixtureOverrides<NormalizedUser> = {}): NormalizedU
     websiteUrl: 'https://codeblog.jonskeet.uk',
     answerCount: 38000,
     questionCount: 7500,
+    creationDate: CREATED_ISO,
+    lastAccessDate: LAST_ACCESS_ISO,
     topTags: [
       { tagName: 'c#', answerCount: 22000, answerScore: 300000 },
       { tagName: 'java', answerCount: 2000, answerScore: 40000 },
@@ -113,6 +118,38 @@ describe('stackexchangeGetUser handler', () => {
     expect(result.badgeCounts).toBeUndefined();
     expect(result.location).toBeUndefined();
     expect(result.topTags).toHaveLength(0);
+  });
+
+  it('rejects an out-of-range userId before calling the service', async () => {
+    const declared = stackexchangeGetUser.errors?.find((e) => e.reason === 'invalid_user_id');
+    expect(declared).toBeDefined();
+
+    const svc = makeUserResult();
+    mockService(svc);
+    const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
+    const input = stackexchangeGetUser.input.parse({ userId: 2147483648 });
+
+    // Bounded in the handler rather than the schema so the rejection travels
+    // the contract path and carries a declared reason plus its recovery hint.
+    await expect(stackexchangeGetUser.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_user_id',
+        recovery: { hint: declared?.recovery },
+      },
+    });
+    expect(svc.getUser).not.toHaveBeenCalled();
+  });
+
+  it('passes the largest in-range userId through to the service', async () => {
+    const svc = makeUserResult();
+    mockService(svc);
+    const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
+    const input = stackexchangeGetUser.input.parse({ userId: 2147483647 });
+
+    await stackexchangeGetUser.handler(input, ctx);
+
+    expect(svc.getUser).toHaveBeenCalledWith(expect.objectContaining({ userId: 2147483647 }), ctx);
   });
 
   it('passes custom site to service', async () => {
@@ -197,5 +234,36 @@ describe('stackexchangeGetUser format', () => {
     const blocks = stackexchangeGetUser.format!(sparse);
     const text = (blocks[0] as { text: string }).text;
     expect(text).not.toContain('Posts:');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Date surfacing
+// ---------------------------------------------------------------------------
+describe('stackexchangeGetUser dates', () => {
+  it('carries ISO 8601 account and last-access dates through structuredContent', async () => {
+    mockService(makeUserResult());
+    const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
+    const input = stackexchangeGetUser.input.parse({ userId: 1 });
+    const result = await stackexchangeGetUser.handler(input, ctx);
+    // Parsed through the tool's own output schema — the framework builds
+    // structuredContent that way, so an undeclared field would be stripped here.
+    const parsed = stackexchangeGetUser.output.parse(result);
+    expect(parsed.creationDate).toBe(CREATED_ISO);
+    expect(parsed.lastAccessDate).toBe(LAST_ACCESS_ISO);
+  });
+
+  it('renders both dates in format()', () => {
+    const text = (stackexchangeGetUser.format!(makeUser())[0] as { text: string }).text;
+    expect(text).toContain(`**Member since:** ${CREATED_ISO}`);
+    expect(text).toContain(`**Last seen:** ${LAST_ACCESS_ISO}`);
+  });
+
+  it('omits the date labels when the profile carries neither date', () => {
+    const sparse = makeUser({ creationDate: undefined, lastAccessDate: undefined });
+    const text = (stackexchangeGetUser.format!(sparse)[0] as { text: string }).text;
+    expect(text).not.toContain('Member since:');
+    expect(text).not.toContain('Last seen:');
+    expect(text).not.toContain('undefined');
   });
 });

@@ -66,32 +66,50 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
 
   async handler(input, ctx) {
     const svc = getStackExchangeService();
-    const { sites, quotaRemaining, quotaMax } = await svc.getSites(ctx);
+    const { sites, quotaRemaining, quotaMax, truncated } = await svc.getSites(ctx);
 
     ctx.enrich({ quotaRemaining, quotaMax });
 
+    // A whitespace-only filter selects nothing to narrow by, so it must not
+    // narrow, must not report a no-match, and must not log as applied.
+    const filterQuery = input.filter?.trim();
+
     let filtered = sites;
-    if (input.filter?.trim()) {
+    if (filterQuery) {
       const normalize = (s: string) =>
         s
           .toLowerCase()
           .normalize('NFKD')
           .replace(/[̀-ͯ]/g, '')
           .replace(/[^a-z0-9\s]/g, ' ');
-      const tokens = normalize(input.filter).split(/\s+/).filter(Boolean);
+      const tokens = normalize(filterQuery).split(/\s+/).filter(Boolean);
       filtered = sites.filter((s) => {
         const hay = `${normalize(s.name)} ${normalize(s.apiSiteParameter)}`;
         return tokens.every((t) => hay.includes(t));
       });
-
-      if (filtered.length === 0) {
-        ctx.enrich.notice(
-          `No site matched "${input.filter}". Call stackexchange_list_sites without a filter to browse all sites.`,
-        );
-      }
     }
 
-    ctx.log.info('Listed SE sites', { total: filtered.length, filtered: !!input.filter });
+    const notices: string[] = [];
+    if (filterQuery && filtered.length === 0) {
+      notices.push(
+        `No site matched "${input.filter}". Call stackexchange_list_sites without a filter to browse all sites.`,
+      );
+    }
+    if (truncated) {
+      notices.push(
+        'This site list is partial — Stack Exchange still reported more sites when the page walk reached its limit. ' +
+          'A site absent from these results may still exist; pass its api_site_parameter directly to another stackexchange_* tool to check.',
+      );
+    }
+    if (notices.length > 0) {
+      ctx.enrich.notice(notices.join(' '));
+    }
+
+    ctx.log.info('Listed SE sites', {
+      total: filtered.length,
+      filtered: Boolean(filterQuery),
+      truncated,
+    });
     return { sites: filtered, totalCount: filtered.length };
   },
 
