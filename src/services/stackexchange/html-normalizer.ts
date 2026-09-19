@@ -318,10 +318,11 @@ function renderTable(body: string): string {
   return `\n${out.join('\n')}\n`;
 }
 
-/** Flatten one table cell to a single line, escaping the pipe that would split it. */
+/** Flatten a table cell, escaping literal backslashes before column separators. */
 function renderCell(cell: string): string {
   return stripTags(cell.replace(/<br\s*\/?>/gi, ' '))
     .replace(/\s+/g, ' ')
+    .replace(/\\/g, '\\\\')
     .replace(/\|/g, '\\|')
     .trim();
 }
