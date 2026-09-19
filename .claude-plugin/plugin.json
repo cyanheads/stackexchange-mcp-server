@@ -1,20 +1,33 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "stackexchange-mcp-server",
   "version": "0.1.14",
   "description": "Search Stack Exchange questions, fetch Q&A threads as markdown, look up tag FAQs and user profiles.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/stackexchange-mcp-server#readme",
   "repository": "https://github.com/cyanheads/stackexchange-mcp-server",
   "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "userConfig": {
+    "stackexchange_api_key": {
+      "type": "string",
+      "title": "Stack Exchange API key",
+      "description": "Optional. Lifts the per-IP quota from about 300/day to about 10,000/day. Register at stackapps.com/apps/oauth/register.",
+      "sensitive": true,
+      "default": ""
+    }
+  },
   "mcpServers": {
     "stackexchange-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/stackexchange-mcp-server"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
-        "STACKEXCHANGE_API_KEY": ""
+        "STACKEXCHANGE_API_KEY": "${user_config.stackexchange_api_key}"
       }
     }
   }

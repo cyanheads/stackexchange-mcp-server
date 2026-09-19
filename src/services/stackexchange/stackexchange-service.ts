@@ -4,6 +4,7 @@
  * @module services/stackexchange/stackexchange-service
  */
 
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
@@ -16,7 +17,7 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { createPacer, fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { decodeHtmlEntities, normalizeHtml } from './html-normalizer.js';
 import type {
   SeAnswer,
@@ -31,6 +32,8 @@ import type {
 
 const BASE_URL = 'https://api.stackexchange.com/2.3';
 const REQUEST_TIMEOUT_MS = 30_000;
+/** Leave headroom within a typical 60-second client timeout, including queue and backoff. */
+const OPERATION_DEADLINE_MS = 50_000;
 
 /** Page size for the /sites walk — 100 is the SE maximum. */
 const SITES_PAGE_SIZE = 100;
@@ -282,24 +285,6 @@ const questionIdOrParameter: BadParameterMapping = (field) =>
       }
     : invalidParameter(field);
 
-/** Module-level backoff tracking — per-process, acceptable for server-side use. */
-let backoffUntil = 0;
-
-/** Honour the SE `backoff` field before the next request. */
-async function waitForBackoff(): Promise<void> {
-  const now = Date.now();
-  if (now < backoffUntil) {
-    await new Promise<void>((resolve) => setTimeout(resolve, backoffUntil - now));
-  }
-}
-
-/** Update the backoff window from a response envelope. */
-function updateBackoff(wrapper: { backoff?: number }): void {
-  if (wrapper.backoff && wrapper.backoff > 0) {
-    backoffUntil = Date.now() + wrapper.backoff * 1000;
-  }
-}
-
 /**
  * Raise the calling tool's `quota_exceeded` error once SE reports the daily
  * quota spent. SE answers HTTP 200 with `quota_remaining: 0` rather than a
@@ -529,9 +514,20 @@ function takeComments(items: SeComment[], pageHasMore: boolean): CommentState {
 
 export class StackExchangeService {
   private readonly apiKey: string | undefined;
+  private backoffUntil = 0;
+  private readonly pacer = createPacer({
+    name: 'stackexchange',
+    maxConcurrent: 1,
+    cooldown: { baseMs: 1000, maxMs: 30_000 },
+  });
 
   constructor(_config: AppConfig, _storage: StorageService, apiKey?: string) {
     this.apiKey = apiKey;
+  }
+
+  /** Reject queued requests during application shutdown. */
+  dispose(): void {
+    this.pacer.dispose();
   }
 
   /** Build a URL with common params (key, gzip). */
@@ -557,13 +553,29 @@ export class StackExchangeService {
    * Fetch, decompress (auto), parse, handle errors. `badParameter` maps a
    * non-site `bad_parameter` rejection onto the calling tool's own contract.
    */
-  private async fetchSe<T>(
+  private fetchSe<T>(
     url: string,
     ctx: Context,
+    signal: AbortSignal,
     badParameter: BadParameterMapping = invalidParameter,
   ): Promise<SeWrapper<T>> {
-    await waitForBackoff();
+    return this.pacer.run(
+      async () => {
+        const waitMs = this.backoffUntil - Date.now();
+        if (waitMs > 0) await sleep(waitMs, undefined, { signal });
+        return this.fetchEnvelope<T>(url, ctx, signal, badParameter);
+      },
+      { signal },
+    );
+  }
 
+  /** Hold the pacer slot until the body has updated the shared backoff window. */
+  private async fetchEnvelope<T>(
+    url: string,
+    ctx: Context,
+    signal: AbortSignal,
+    badParameter: BadParameterMapping,
+  ): Promise<SeWrapper<T>> {
     let response: Response;
     try {
       response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, ctx, {
@@ -571,7 +583,7 @@ export class StackExchangeService {
           'Accept-Encoding': 'gzip',
           Accept: 'application/json',
         },
-        signal: ctx.signal,
+        signal,
         expectedStatuses: [400],
       });
     } catch (error) {
@@ -653,7 +665,9 @@ export class StackExchangeService {
       );
     }
 
-    updateBackoff(wrapper);
+    if (wrapper.backoff && wrapper.backoff > 0) {
+      this.backoffUntil = Math.max(this.backoffUntil, Date.now() + wrapper.backoff * 1000);
+    }
 
     ctx.log.debug('SE quota', {
       quota_remaining: wrapper.quota_remaining,
@@ -674,7 +688,7 @@ export class StackExchangeService {
     hasMore: boolean;
   }> {
     return withRetry(
-      async () => {
+      async ({ signal }) => {
         /**
          * Resolve one effective SE sort. SE `min` constrains the current sort
          * field (not score), so a minScore filter forces `votes` — its only
@@ -710,7 +724,7 @@ export class StackExchangeService {
         }
 
         const url = this.buildUrl('/search/advanced', params);
-        const wrapper = await this.fetchSe<SeQuestion>(url, ctx);
+        const wrapper = await this.fetchSe<SeQuestion>(url, ctx, signal);
 
         assertQuotaRemaining(wrapper, ctx);
 
@@ -725,6 +739,7 @@ export class StackExchangeService {
       },
       {
         operation: 'searchQuestions',
+        deadlineMs: OPERATION_DEADLINE_MS,
         context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
@@ -742,7 +757,7 @@ export class StackExchangeService {
     quotaMax: number;
   }> {
     return withRetry(
-      async () => {
+      async ({ signal }) => {
         const questionUrl = this.buildUrl(`/questions/${opts.questionId}`, {
           site: opts.site,
           filter: 'withbody',
@@ -754,10 +769,18 @@ export class StackExchangeService {
           pagesize: opts.maxAnswers ?? 10,
         });
 
-        const [questionWrapper, answersWrapper] = await Promise.all([
-          this.fetchSe<SeQuestion>(questionUrl, ctx, questionIdOrParameter),
-          this.fetchSe<SeAnswer>(answersUrl, ctx, questionIdOrParameter),
-        ]);
+        const questionWrapper = await this.fetchSe<SeQuestion>(
+          questionUrl,
+          ctx,
+          signal,
+          questionIdOrParameter,
+        );
+        const answersWrapper = await this.fetchSe<SeAnswer>(
+          answersUrl,
+          ctx,
+          signal,
+          questionIdOrParameter,
+        );
 
         assertQuotaRemaining(questionWrapper, ctx);
 
@@ -786,7 +809,7 @@ export class StackExchangeService {
           });
           // Default mapping, not questionIdOrParameter: `ids` on /answers/{id}
           // is the answer ID SE itself reported, never the caller's input.
-          const acceptedWrapper = await this.fetchSe<SeAnswer>(acceptedUrl, ctx);
+          const acceptedWrapper = await this.fetchSe<SeAnswer>(acceptedUrl, ctx, signal);
           const acceptedAnswer = acceptedWrapper.items[0];
           if (acceptedAnswer) {
             answerItems.push(acceptedAnswer);
@@ -831,16 +854,16 @@ export class StackExchangeService {
               ? this.buildUrl(`/answers/${answerIds.join(';')}/comments`, commentParams)
               : undefined;
 
-          const [questionCommentsWrapper, answerCommentsWrapper] = await Promise.all([
-            // `ids` here is the question ID the caller supplied, as on the other
-            // /questions routes.
-            this.fetchSe<SeComment>(questionCommentsUrl, ctx, questionIdOrParameter),
-            // Default mapping: `ids` here is the answer ID list SE itself
-            // returned, never the caller's input.
-            answerCommentsUrl
-              ? this.fetchSe<SeComment>(answerCommentsUrl, ctx)
-              : Promise.resolve(undefined),
-          ]);
+          const questionCommentsWrapper = await this.fetchSe<SeComment>(
+            questionCommentsUrl,
+            ctx,
+            signal,
+            questionIdOrParameter,
+          );
+          // Answer IDs came from SE; they are not the caller's question ID.
+          const answerCommentsWrapper = answerCommentsUrl
+            ? await this.fetchSe<SeComment>(answerCommentsUrl, ctx, signal)
+            : undefined;
 
           questionComments = takeComments(
             questionCommentsWrapper.items,
@@ -913,6 +936,7 @@ export class StackExchangeService {
       },
       {
         operation: 'getThread',
+        deadlineMs: OPERATION_DEADLINE_MS,
         context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
@@ -931,13 +955,13 @@ export class StackExchangeService {
     hasMore: boolean;
   }> {
     return withRetry(
-      async () => {
+      async ({ signal }) => {
         const url = this.buildUrl(`/tags/${encodeURIComponent(opts.tag)}/faq`, {
           site: opts.site,
           pagesize: opts.pageSize ?? 10,
           page: opts.page,
         });
-        const wrapper = await this.fetchSe<SeQuestion>(url, ctx);
+        const wrapper = await this.fetchSe<SeQuestion>(url, ctx, signal);
 
         assertQuotaRemaining(wrapper, ctx);
 
@@ -952,6 +976,7 @@ export class StackExchangeService {
       },
       {
         operation: 'getTagFaq',
+        deadlineMs: OPERATION_DEADLINE_MS,
         context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
@@ -969,7 +994,7 @@ export class StackExchangeService {
     quotaMax: number;
   }> {
     return withRetry(
-      async () => {
+      async ({ signal }) => {
         const profileUrl = this.buildUrl(`/users/${opts.userId}`, {
           site: opts.site,
           filter: SE_USER_FILTER,
@@ -979,10 +1004,8 @@ export class StackExchangeService {
           pagesize: 10,
         });
 
-        const [profileWrapper, topTagsWrapper] = await Promise.all([
-          this.fetchSe<SeUser>(profileUrl, ctx),
-          this.fetchSe<SeTopTag>(topTagsUrl, ctx),
-        ]);
+        const profileWrapper = await this.fetchSe<SeUser>(profileUrl, ctx, signal);
+        const topTagsWrapper = await this.fetchSe<SeTopTag>(topTagsUrl, ctx, signal);
 
         assertQuotaRemaining(profileWrapper, ctx);
 
@@ -1026,6 +1049,7 @@ export class StackExchangeService {
       },
       {
         operation: 'getUser',
+        deadlineMs: OPERATION_DEADLINE_MS,
         context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
@@ -1045,7 +1069,7 @@ export class StackExchangeService {
     truncated: boolean;
   }> {
     return withRetry(
-      async () => {
+      async ({ signal }) => {
         // SE API returns site names and audiences HTML-encoded (e.g. "Unix &amp; Linux")
         const normalizeSite = (s: SeSite): NormalizedSite => ({
           name: decodeHtmlEntities(s.name),
@@ -1065,6 +1089,7 @@ export class StackExchangeService {
           const wrapper = await this.fetchSe<SeSite>(
             this.buildUrl('/sites', { pagesize: SITES_PAGE_SIZE, page }),
             ctx,
+            signal,
           );
           assertQuotaRemaining(wrapper, ctx);
           return wrapper;
@@ -1087,6 +1112,7 @@ export class StackExchangeService {
       },
       {
         operation: 'getSites',
+        deadlineMs: OPERATION_DEADLINE_MS,
         context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,

@@ -119,6 +119,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
   errors: [
     {
       reason: 'invalid_site',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
@@ -126,6 +127,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     },
     {
       reason: 'invalid_parameter',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'Stack Exchange rejected a request parameter and named the field rather than reporting a bad site.',
       recovery:
@@ -133,6 +135,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     },
     {
       reason: 'quota_exceeded',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: 'The Stack Exchange API quota_remaining has reached 0.',
       recovery:
@@ -140,6 +143,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     },
     {
       reason: 'paging_depth_limit',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.Forbidden,
       when: 'Stack Exchange refused the requested page because paging above page 25 needs a key.',
       recovery:
@@ -147,6 +151,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     },
     {
       reason: 'invalid_api_key',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ConfigurationError,
       when: 'Stack Exchange does not recognize the API key this server is configured with.',
       recovery:
@@ -154,6 +159,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     },
     {
       reason: 'upstream_unavailable',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
       recovery:

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.14-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/stackexchange-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20Server-2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/stackexchange-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/stackexchange-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.14-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/stackexchange-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/stackexchange-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/stackexchange-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -27,97 +27,87 @@
 
 ---
 
-## Tools
+## Overview
 
-Five tools for working with Stack Overflow and the wider Stack Exchange network:
+Stack Exchange network access — Stack Overflow, Super User, Server Fault, Unix & Linux, and the wider network. Search questions, fetch complete Q&A threads as clean markdown, browse tag FAQs, and look up user profiles from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:---|:---|
 | `stackexchange_search_questions` | Search questions across a Stack Exchange site with full-text query, tag filters, score threshold, and sort order |
-| `stackexchange_get_thread` | Fetch a complete Q&A thread — question body and all answers as clean markdown, accepted answer first |
+| `stackexchange_get_thread` | Fetch a question and its answers as markdown, with a configurable answer limit and the accepted answer first |
 | `stackexchange_get_tag_faq` | Fetch the highest-voted answered questions for a tag — the canonical "best answers in X" list |
 | `stackexchange_get_user` | Fetch a user profile by ID: reputation, badge counts, top tags by answer score, and account metadata |
 | `stackexchange_list_sites` | Enumerate all Stack Exchange network sites and their `api_site_parameter` values |
 
-### `stackexchange_search_questions`
+---
 
-Search questions across any Stack Exchange site.
+## Capability reference
 
-- Full-text search with optional tag filters, minimum score threshold, and accepted-only filter
-- Sort by relevance, votes, activity, or newest
-- Returns question ID, title, score, answer count, tags, and excerpt — IDs flow directly into `stackexchange_get_thread`
-- Quota remaining surfaced on every response so agents can plan around rate limits
+### `stackexchange_search_questions` <sub>tool</sub>
+
+- Full-text query with optional tag filters, minimum score threshold, and accepted-only filter; sort by relevance (default), votes, activity, or newest
+- Up to 30 results per page (default 10); `page` for more — each page costs one API quota unit, and paging past 25 requires `STACKEXCHANGE_API_KEY`
+- Returns question ID, title, score, answer count, tags, and a ~300-character excerpt — IDs flow directly into `stackexchange_get_thread`
+- Quota remaining and max surfaced via enrichment on every response
 
 ---
 
-### `stackexchange_get_thread`
+### `stackexchange_get_thread` <sub>tool</sub>
 
-Fetch a complete Q&A thread in one call — the server's primary value-add.
-
-- Accepts a numeric question ID or a full Stack Exchange question URL
-- Fetches question body + all answers in parallel (two upstream calls via `Promise.all`)
-- HTML→markdown normalization baked in: `<pre><code>` → fenced code blocks, `<p>`, `<a>`, lists, headers, blockquotes all converted
-- Accepted answer always first, then sorted by score descending
-- Attribution (author display name + profile link + score) included on each answer per CC BY-SA 4.0
-- Configurable `maxAnswers` (default 10, up to 100)
+- Accepts a numeric question ID or a full Stack Exchange question URL; fetches the question and a page of `maxAnswers` answers (1–100, default 10), adding the accepted answer if it falls outside that page
+- HTML→markdown normalization built in — code blocks, links, lists, headers, and blockquotes all converted
+- Optional `includeComments` fetches up to 20 comments per post, newest first, using two extra API calls (one when there are no answers); `commentsTruncated` reports partial lists
+- Attribution (author name, profile link, score) on every answer per CC BY-SA 4.0
+- Quota remaining and max surfaced via enrichment; `truncated` when more answers exist upstream than `maxAnswers` returned
 
 ---
 
-### `stackexchange_get_tag_faq`
+### `stackexchange_get_tag_faq` <sub>tool</sub>
 
-Browse the authoritative community answers on a topic.
-
-- Maps to `/tags/{tag}/faq` — the highest-voted answered questions in a tag
-- Returns question list without bodies; pipe any result into `stackexchange_get_thread` for full content
-- Useful for "what are the canonical resources on Python async?" type queries
-
----
-
-### `stackexchange_get_user`
-
-Credibility context for an answer author.
-
-- Fetches profile + top tags in parallel (two upstream calls)
-- Returns reputation, badge counts (gold/silver/bronze), location, website, post counts, and top 10 tags by answer score
-- `owner.user_id` from `stackexchange_get_thread` output can be passed directly
+- Highest-voted answered questions for a tag — maps to `/tags/{tag}/faq`, the canonical "best answers in X" list
+- Up to 30 results per page (default 10); `page` for more — each page costs one API quota unit, and paging past 25 requires `STACKEXCHANGE_API_KEY`
+- Returns a question list without bodies; pipe any `questionId` into `stackexchange_get_thread` for full content
+- Quota remaining and max surfaced via enrichment on every response
 
 ---
 
-### `stackexchange_list_sites`
+### `stackexchange_get_user` <sub>tool</sub>
 
-Discover `api_site_parameter` values for any Stack Exchange community.
+- `userId` must be at most 2,147,483,647 (32-bit) — typically the `authorUserId` from `stackexchange_get_thread` output
+- Fetches the profile and top tags in two upstream API calls
+- Returns reputation, badge counts (gold/silver/bronze), location, website, answer/question counts, and up to 10 top tags by answer score (empty array for users with no answers)
+- An unknown user ID returns a typed `user_not_found` error — Stack Exchange answers HTTP 200 with empty results rather than 404
 
-- Fetches the full ~190-site network list live; optional case-insensitive name filter applied client-side
-- The `api_site_parameter` value (e.g. `stackoverflow`, `superuser`, `serverfault`) is what every other tool's `site` parameter accepts
+---
+
+### `stackexchange_list_sites` <sub>tool</sub>
+
+- Fetches every site in the Stack Exchange network, walking pages of 100 up to a 10-page cap; an enrichment notice flags a partial list if the network still has more
+- Optional case-insensitive name filter matches against site name and `api_site_parameter`, applied client-side after the fetch
+- Returns the `api_site_parameter` value (e.g. `stackoverflow`, `superuser`, `serverfault`) that every other tool's `site` parameter accepts
 
 ---
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool definitions — single file per primitive, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 Stack Exchange-specific:
 
-- Custom HTML→markdown normalizer covers the full SE post tag set with no external dependencies
-- Backoff tracking: respects the `backoff` field in SE API responses to avoid throttling
+- HTML→markdown conversion preserves code blocks, tables, links, images, and nested lists
+- Shared upstream queue honors response backoff and HTTP 429 cooldowns; each operation has a 50-second budget covering queue time, backoff, requests, and retries
 - Quota logging: `quota_remaining` and `quota_max` surfaced via enrichment on every tool call
 - Typed error contracts on every tool — `invalid_site`, `invalid_parameter`, `invalid_api_key`, `invalid_id_or_url`, `invalid_user_id`, `question_not_found`, `user_not_found`, `paging_depth_limit`, `quota_exceeded`, and `upstream_unavailable`
-- Parallel upstream calls in `get_thread` and `get_user` via `Promise.all`
 - Optional `STACKEXCHANGE_API_KEY` lifts the per-IP quota from ~300/day to ~10,000/day with no OAuth required
 
 Agent-friendly output:
 
 - Quota remaining on every response — agents can plan around rate limits without the server needing to fail
-- Accepted-answer-first ordering is hardcoded — the community's explicit quality signal, not a preference
-- Attribution on every answer per CC BY-SA 4.0 — provenance preserved without agent effort
-- Typed `not_found` errors for missing questions and users (SE returns HTTP 200 with empty `items[]` — the server handles this correctly)
+- The accepted answer appears first, followed by the remaining answers sorted by score
+- Each answer includes attribution under CC BY-SA 4.0
+- Typed `not_found` errors for missing questions and users (SE returns HTTP 200 with empty `items[]` rather than 404)
 
 ---
 
@@ -205,7 +195,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+)
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+)
 - A `STACKEXCHANGE_API_KEY` is optional but strongly recommended for any sustained use
 
 ### Installation
@@ -245,7 +235,7 @@ cp .env.example .env
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_HTTP_HOST` | Host for HTTP server. | `127.0.0.1` |
-| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. `auto` resolves to stateful; this server sets stateless explicitly. | `stateless` |
+| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. `auto` resolves to stateful. A meaningful env value overrides this server's stateless source default; blank or unsubstituted placeholders use the source default. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
@@ -317,7 +307,7 @@ See [`CLAUDE.md`/`AGENTS.md`](./CLAUDE.md) for development guidelines and archit
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck

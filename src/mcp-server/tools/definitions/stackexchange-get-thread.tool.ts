@@ -245,6 +245,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
   errors: [
     {
       reason: 'question_not_found',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.NotFound,
       when: 'The question lookup returns an empty result set — SE returns HTTP 200 with no items for unknown question IDs rather than 404.',
       recovery:
@@ -252,6 +253,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     },
     {
       reason: 'invalid_site',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
@@ -259,6 +261,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     },
     {
       reason: 'invalid_id_or_url',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The input is not a parseable integer ID and not a recognizable SE question URL.',
       recovery:
@@ -266,6 +269,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     },
     {
       reason: 'invalid_parameter',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'Stack Exchange rejected a request parameter other than the question ID, and named the field.',
       recovery:
@@ -273,6 +277,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     },
     {
       reason: 'quota_exceeded',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: 'The Stack Exchange API quota_remaining has reached 0.',
       recovery:
@@ -280,6 +285,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     },
     {
       reason: 'invalid_api_key',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ConfigurationError,
       when: 'Stack Exchange does not recognize the API key this server is configured with.',
       recovery:
@@ -287,6 +293,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     },
     {
       reason: 'upstream_unavailable',
+      thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
       recovery:
