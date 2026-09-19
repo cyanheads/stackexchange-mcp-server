@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.15](changelog/0.1.x/0.1.15.md) — 2026-09-19
+
+Bounded Stack Exchange requests, safer markdown tables, and the mcp-ts-core 0.13.6 runtime adoption.
+
 ## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-09-09
 
 Reference-style links, definition lines, and blockquote markers no longer survive into search excerpts as literal text
