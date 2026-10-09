@@ -762,7 +762,7 @@ const sitePage = (
   });
 
 describe('stackexchange_list_sites error contract', () => {
-  it('advertises a contract at all, so ctx.recoveryFor has something to resolve', () => {
+  it('advertises a contract at all, so a recovery hint has something to resolve from', () => {
     // Pre-fix this tool declared no errors[], so every failure reached the
     // caller with no reason to branch on and no recovery hint.
     expect(declaredReasons(stackexchangeListSites).length).toBeGreaterThan(0);

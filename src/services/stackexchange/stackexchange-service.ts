@@ -292,12 +292,10 @@ const questionIdOrParameter: BadParameterMapping = (field) =>
  */
 function assertQuotaRemaining(
   wrapper: Pick<SeWrapper<unknown>, 'quota_max' | 'quota_remaining'>,
-  ctx: Context,
 ): void {
   if (wrapper.quota_remaining !== 0) return;
   throw rateLimited('Stack Exchange API quota exhausted.', {
     reason: 'quota_exceeded',
-    ...ctx.recoveryFor('quota_exceeded'),
     quota_remaining: 0,
     quota_max: wrapper.quota_max,
   });
@@ -608,7 +606,6 @@ export class StackExchangeService {
         if (errObj?.error_name === 'access_denied' && /\bpage\b/i.test(errObj.error_message)) {
           throw forbidden(`Stack Exchange refused the request: ${errObj.error_message}`, {
             reason: 'paging_depth_limit',
-            ...ctx.recoveryFor('paging_depth_limit'),
             error_name: errObj.error_name,
             error_id: errObj.error_id,
           });
@@ -625,7 +622,6 @@ export class StackExchangeService {
               'Stack Exchange did not recognize the API key this server is configured with — STACKEXCHANGE_API_KEY is not a registered Stack Apps key.',
               {
                 reason: 'invalid_api_key',
-                ...ctx.recoveryFor('invalid_api_key'),
                 error_name: errObj.error_name,
                 error_id: errObj.error_id,
               },
@@ -643,7 +639,6 @@ export class StackExchangeService {
               : badParameter(detail);
           throw validationError(message, {
             reason,
-            ...ctx.recoveryFor(reason),
             error_name: errObj.error_name,
             error_id: errObj.error_id,
           });
@@ -660,7 +655,7 @@ export class StackExchangeService {
     } catch (err) {
       throw serviceUnavailable(
         'Failed to parse Stack Exchange response',
-        { reason: 'upstream_unavailable', ...ctx.recoveryFor('upstream_unavailable') },
+        { reason: 'upstream_unavailable' },
         { cause: err },
       );
     }
@@ -726,7 +721,7 @@ export class StackExchangeService {
         const url = this.buildUrl('/search/advanced', params);
         const wrapper = await this.fetchSe<SeQuestion>(url, ctx, signal);
 
-        assertQuotaRemaining(wrapper, ctx);
+        assertQuotaRemaining(wrapper);
 
         const questions: NormalizedQuestion[] = wrapper.items.map(normalizeQuestion);
 
@@ -782,13 +777,12 @@ export class StackExchangeService {
           questionIdOrParameter,
         );
 
-        assertQuotaRemaining(questionWrapper, ctx);
+        assertQuotaRemaining(questionWrapper);
 
         const q = questionWrapper.items[0];
         if (!q) {
           throw notFound(`Question ID ${opts.questionId} not found on site "${opts.site}".`, {
             reason: 'question_not_found',
-            ...ctx.recoveryFor('question_not_found'),
             questionId: opts.questionId,
             site: opts.site,
           });
@@ -963,7 +957,7 @@ export class StackExchangeService {
         });
         const wrapper = await this.fetchSe<SeQuestion>(url, ctx, signal);
 
-        assertQuotaRemaining(wrapper, ctx);
+        assertQuotaRemaining(wrapper);
 
         const questions: NormalizedQuestion[] = wrapper.items.map(normalizeQuestion);
 
@@ -1007,13 +1001,12 @@ export class StackExchangeService {
         const profileWrapper = await this.fetchSe<SeUser>(profileUrl, ctx, signal);
         const topTagsWrapper = await this.fetchSe<SeTopTag>(topTagsUrl, ctx, signal);
 
-        assertQuotaRemaining(profileWrapper, ctx);
+        assertQuotaRemaining(profileWrapper);
 
         const u = profileWrapper.items[0];
         if (!u) {
           throw notFound(`User ID ${opts.userId} not found on site "${opts.site}".`, {
             reason: 'user_not_found',
-            ...ctx.recoveryFor('user_not_found'),
             userId: opts.userId,
             site: opts.site,
           });
@@ -1091,7 +1084,7 @@ export class StackExchangeService {
             ctx,
             signal,
           );
-          assertQuotaRemaining(wrapper, ctx);
+          assertQuotaRemaining(wrapper);
           return wrapper;
         };
 

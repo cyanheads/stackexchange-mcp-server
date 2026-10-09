@@ -165,7 +165,6 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
       throw ctx.fail(
         'invalid_user_id',
         `userId ${input.userId} is out of range — Stack Exchange user IDs are 32-bit integers (max ${MAX_USER_ID}).`,
-        ctx.recoveryFor('invalid_user_id'),
       );
     }
 

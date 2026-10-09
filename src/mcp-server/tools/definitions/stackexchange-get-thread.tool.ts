@@ -307,7 +307,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       throw ctx.fail(
         'invalid_id_or_url',
         `Cannot parse "${input.questionIdOrUrl}" as a question ID or SE question URL.`,
-        { ...ctx.recoveryFor('invalid_id_or_url'), input: input.questionIdOrUrl },
+        { input: input.questionIdOrUrl },
       );
     }
 

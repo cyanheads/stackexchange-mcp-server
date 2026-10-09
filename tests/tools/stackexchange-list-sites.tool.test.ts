@@ -26,8 +26,8 @@ const mockService = (service: Partial<ReturnType<typeof getStackExchangeService>
 };
 
 /**
- * A mock context bound to the tool's own error contract, so `ctx.fail` and
- * `ctx.recoveryFor` resolve the reasons stackexchange_list_sites declares.
+ * A mock context bound to the tool's own error contract, so `ctx.fail`
+ * resolves the reasons stackexchange_list_sites declares.
  */
 const contractCtx = () => createMockContext({ errors: stackexchangeListSites.errors });
 

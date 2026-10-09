@@ -121,22 +121,18 @@ describe('stackexchangeGetUser handler', () => {
   });
 
   it('rejects an out-of-range userId before calling the service', async () => {
-    const declared = stackexchangeGetUser.errors?.find((e) => e.reason === 'invalid_user_id');
-    expect(declared).toBeDefined();
-
     const svc = makeUserResult();
     mockService(svc);
     const ctx = createMockContext({ errors: stackexchangeGetUser.errors });
     const input = stackexchangeGetUser.input.parse({ userId: 2147483648 });
 
     // Bounded in the handler rather than the schema so the rejection travels
-    // the contract path and carries a declared reason plus its recovery hint.
+    // the contract path and carries a declared reason. The framework attaches
+    // the reason's recovery hint at the tool boundary — asserted on the wire in
+    // error-contract.wire.test.ts.
     await expect(stackexchangeGetUser.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
-      data: {
-        reason: 'invalid_user_id',
-        recovery: { hint: declared?.recovery },
-      },
+      data: { reason: 'invalid_user_id' },
     });
     expect(svc.getUser).not.toHaveBeenCalled();
   });

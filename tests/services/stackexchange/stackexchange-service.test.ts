@@ -1424,47 +1424,6 @@ describe('StackExchangeService hasMore threading', () => {
 });
 
 describe('StackExchangeService bad_parameter classification', () => {
-  /**
-   * A stand-in contract, not any one tool's. The service resolves the reason
-   * and hint from whatever contract the calling context carries — asserting
-   * against a synthetic one proves that, where a real tool's contract would
-   * only prove the two happen to agree.
-   */
-  const CONTRACT = [
-    {
-      reason: 'invalid_site',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'Unknown site.',
-      recovery: 'Recovery text for the invalid site case.',
-    },
-    {
-      reason: 'invalid_parameter',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'A named parameter was refused.',
-      recovery: 'Recovery text for the rejected parameter case.',
-    },
-    {
-      reason: 'invalid_id_or_url',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'The question ID was refused.',
-      recovery: 'Recovery text for the invalid question id case.',
-    },
-    {
-      reason: 'user_not_found',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'No such user.',
-      recovery: 'Recovery text for the missing user case.',
-    },
-    {
-      reason: 'question_not_found',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'No such question.',
-      recovery: 'Recovery text for the missing question case.',
-    },
-  ] as const;
-
-  const contractCtx = () => createMockContext({ errors: CONTRACT });
-
   /** The McpError a call rejected with. */
   const rejection = async (run: () => Promise<unknown>): Promise<McpError> => {
     const error = await run().then(
@@ -1483,14 +1442,13 @@ describe('StackExchangeService bad_parameter classification', () => {
     );
 
     const error = await rejection(() =>
-      makeService().getTagFaq({ tag: 'python', site: 'notarealsite' }, contractCtx()),
+      makeService().getTagFaq({ tag: 'python', site: 'notarealsite' }, createMockContext()),
     );
 
     expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(error.message).toBe('Stack Exchange API error: No site found for name `notarealsite`');
     expect(error.data).toMatchObject({
       reason: 'invalid_site',
-      recovery: { hint: 'Recovery text for the invalid site case.' },
       error_name: 'bad_parameter',
       error_id: 400,
     });
@@ -1500,7 +1458,7 @@ describe('StackExchangeService bad_parameter classification', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => badParameterResponse('site'));
 
     const error = await rejection(() =>
-      makeService().getTagFaq({ tag: 'python', site: '' }, contractCtx()),
+      makeService().getTagFaq({ tag: 'python', site: '' }, createMockContext()),
     );
 
     expect(error.data).toMatchObject({ reason: 'invalid_site' });
@@ -1510,52 +1468,49 @@ describe('StackExchangeService bad_parameter classification', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => badParameterResponse('pagesize'));
 
     const error = await rejection(() =>
-      makeService().getTagFaq({ tag: 'python', site: 'stackoverflow' }, contractCtx()),
+      makeService().getTagFaq({ tag: 'python', site: 'stackoverflow' }, createMockContext()),
     );
 
     // Pre-fix every non-`ids` rejection came back as invalid_site with the raw
     // field name pasted after "Stack Exchange API error:".
     expect(error.message).toBe('Stack Exchange rejected the "pagesize" parameter.');
-    expect(error.data).toMatchObject({
-      reason: 'invalid_parameter',
-      recovery: { hint: 'Recovery text for the rejected parameter case.' },
-    });
+    expect(error.data).toMatchObject({ reason: 'invalid_parameter' });
   });
 
   it('reads an `ids` rejection on a /questions route as a bad question ID', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => badParameterResponse('ids'));
 
     const error = await rejection(() =>
-      makeService().getThread({ questionId: 2_147_483_648, site: 'stackoverflow' }, contractCtx()),
+      makeService().getThread(
+        { questionId: 2_147_483_648, site: 'stackoverflow' },
+        createMockContext(),
+      ),
     );
 
     expect(error.message).toBe('The question ID is not a valid Stack Exchange question ID.');
-    expect(error.data).toMatchObject({
-      reason: 'invalid_id_or_url',
-      recovery: { hint: 'Recovery text for the invalid question id case.' },
-    });
+    expect(error.data).toMatchObject({ reason: 'invalid_id_or_url' });
   });
 
   it.each([
     [
       'getUser',
-      (svc: StackExchangeService, ctx: ReturnType<typeof contractCtx>) =>
+      (svc: StackExchangeService, ctx: ReturnType<typeof createMockContext>) =>
         svc.getUser({ userId: 2_147_483_648, site: 'stackoverflow' }, ctx),
     ],
     [
       'getTagFaq',
-      (svc: StackExchangeService, ctx: ReturnType<typeof contractCtx>) =>
+      (svc: StackExchangeService, ctx: ReturnType<typeof createMockContext>) =>
         svc.getTagFaq({ tag: 'python', site: 'stackoverflow' }, ctx),
     ],
     [
       'searchQuestions',
-      (svc: StackExchangeService, ctx: ReturnType<typeof contractCtx>) =>
+      (svc: StackExchangeService, ctx: ReturnType<typeof createMockContext>) =>
         svc.searchQuestions({ query: 'q', site: 'stackoverflow' }, ctx),
     ],
   ])('does not read an `ids` rejection on a %s route as a question ID', async (_name, call) => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => badParameterResponse('ids'));
 
-    const error = await rejection(() => call(makeService(), contractCtx()));
+    const error = await rejection(() => call(makeService(), createMockContext()));
 
     expect(error.message).not.toContain('question ID');
     expect(error.message).toBe('Stack Exchange rejected the "ids" parameter.');
@@ -1563,7 +1518,12 @@ describe('StackExchangeService bad_parameter classification', () => {
   });
 });
 
-describe('StackExchangeService recovery hints resolve from the caller contract', () => {
+/**
+ * Service throws name the reason and leave the hint to the framework, which
+ * fills it from the calling tool's `errors[]` entry at the tool boundary —
+ * asserted per reason on the wire in error-contract.wire.test.ts.
+ */
+describe('StackExchangeService leaves recovery hints to the tool contract', () => {
   const USER_CONTRACT = [
     {
       reason: 'user_not_found',
@@ -1592,24 +1552,16 @@ describe('StackExchangeService recovery hints resolve from the caller contract',
     return error.data as Record<string, unknown>;
   };
 
-  it('attaches the hint the calling contract declares', async () => {
+  it.each([
+    ['a calling contract', () => createMockContext({ errors: USER_CONTRACT })],
+    ['no contract', () => createMockContext()],
+  ])('carries the reason and no hint with %s', async (_label, makeCtx) => {
     emptyUserFetch();
 
-    const data = await userRejection(createMockContext({ errors: USER_CONTRACT }));
+    const data = await userRejection(makeCtx());
 
-    expect(data.reason).toBe('user_not_found');
-    expect(data.recovery).toEqual({
-      hint: 'Recovery text supplied by the calling tool contract.',
-    });
-  });
-
-  it('omits recovery entirely when the caller declares no contract', async () => {
-    emptyUserFetch();
-
-    const data = await userRejection(createMockContext());
-
-    // The hint is never a service-side literal — with nothing to resolve
-    // against, the spread contributes nothing and the reason still rides.
+    // The hint is never a service-side literal: an explicit one here would
+    // override whatever the calling tool declares.
     expect(data.reason).toBe('user_not_found');
     expect(data).not.toHaveProperty('recovery');
   });
@@ -2052,15 +2004,6 @@ describe('StackExchangeService paging depth limit', () => {
       { status: 400 },
     );
 
-  const CONTRACT = [
-    {
-      reason: 'paging_depth_limit',
-      code: JsonRpcErrorCode.Forbidden,
-      when: 'SE refused the requested page depth.',
-      recovery: 'Recovery text for the paging depth case.',
-    },
-  ] as const;
-
   const rejection = async (run: () => Promise<unknown>): Promise<McpError> => {
     const error = await run().then(
       () => {
@@ -2078,7 +2021,7 @@ describe('StackExchangeService paging depth limit', () => {
     const error = await rejection(() =>
       makeService().searchQuestions(
         { query: 'q', site: 'stackoverflow', page: 26 },
-        createMockContext({ errors: CONTRACT }),
+        createMockContext(),
       ),
     );
 
@@ -2088,7 +2031,6 @@ describe('StackExchangeService paging depth limit', () => {
     expect(error.message).toContain('page above 25 requires access token or app key');
     expect(error.data).toMatchObject({
       reason: 'paging_depth_limit',
-      recovery: { hint: 'Recovery text for the paging depth case.' },
       error_name: 'access_denied',
       error_id: 403,
     });
@@ -2102,7 +2044,7 @@ describe('StackExchangeService paging depth limit', () => {
     const error = await rejection(() =>
       makeService().getTagFaq(
         { tag: 'python', site: 'stackoverflow', page: 30 },
-        createMockContext({ errors: CONTRACT }),
+        createMockContext(),
       ),
     );
 
@@ -2116,7 +2058,7 @@ describe('StackExchangeService paging depth limit', () => {
     const error = await rejection(() =>
       makeService().searchQuestions(
         { query: 'q', site: 'stackoverflow', page: 26 },
-        createMockContext({ errors: CONTRACT }),
+        createMockContext(),
       ),
     );
 
@@ -2132,10 +2074,7 @@ describe('StackExchangeService paging depth limit', () => {
     );
 
     const error = await rejection(() =>
-      makeService().searchQuestions(
-        { query: 'q', site: 'stackoverflow' },
-        createMockContext({ errors: CONTRACT }),
-      ),
+      makeService().searchQuestions({ query: 'q', site: 'stackoverflow' }, createMockContext()),
     );
 
     expect((error.data as Record<string, unknown>).reason).toBeUndefined();
@@ -2148,16 +2087,7 @@ describe('StackExchangeService paging depth limit', () => {
     const error = await rejection(() =>
       makeService().searchQuestions(
         { query: 'q', site: 'stackoverflow', page: 2 },
-        createMockContext({
-          errors: [
-            {
-              reason: 'invalid_parameter',
-              code: JsonRpcErrorCode.ValidationError,
-              when: 'A named parameter was refused.',
-              recovery: 'Recovery text for the rejected parameter case.',
-            },
-          ] as const,
-        }),
+        createMockContext(),
       ),
     );
 
