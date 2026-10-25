@@ -3,7 +3,11 @@
 /.claude/
 /.agents/
 /framework-skills/
-/docs/idea.md
+/docs/
+/src/
+/scripts/
+/.github/
+/.vscode/
 /logs/
 /.cache/
 /coverage/
