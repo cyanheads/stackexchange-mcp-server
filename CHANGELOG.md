@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.17](changelog/0.1.x/0.1.17.md) — 2026-10-25
+
+Plain-text titles, names, links, and empty-result notices retain their literal text in Markdown output; adopts mcp-ts-core 0.13.16 and refreshes dependencies and packaging.
+
 ## [0.1.16](changelog/0.1.x/0.1.16.md) — 2026-10-08
 
 Adopts mcp-ts-core 0.13.14: numeric-string and null tool arguments are repaired before validation, tool error results carry their request ID, and multi-arch Docker builds no longer run Bun under emulation.
