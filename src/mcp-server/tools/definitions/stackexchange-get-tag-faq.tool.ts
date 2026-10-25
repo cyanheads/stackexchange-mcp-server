@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
 export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
@@ -112,6 +113,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       .describe('Actionable guidance when results are empty or filtered.'),
   },
   enrichmentTrailer: {
+    notice: { render: (value) => (value === undefined ? '' : `> ${escapeMarkdownInline(value)}`) },
     quotaRemaining: { label: 'Quota Remaining' },
     quotaMax: { label: 'Quota Max' },
   },
@@ -219,7 +221,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
 
   format: (result) => {
     const lines: string[] = [
-      `## Tag FAQ: \`${result.tag}\` on ${result.site} — page ${result.page}\n`,
+      `## Tag FAQ: ${escapeMarkdownInline(result.tag)} on ${escapeMarkdownInline(result.site)} — page ${result.page}\n`,
     ];
     if (result.questions.length === 0) {
       lines.push('No FAQ questions found for this tag.');
@@ -228,7 +230,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       return [{ type: 'text', text: lines.join('\n') }];
     }
     for (const q of result.questions) {
-      lines.push(`### ${q.title}`);
+      lines.push(`### ${escapeMarkdownInline(q.title)}`);
       const stats = [
         `**ID:** ${q.questionId}`,
         `**Score:** ${q.score}`,
@@ -238,8 +240,8 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       if (q.creationDate) stats.push(`**Asked:** ${q.creationDate}`);
       if (q.lastActivityDate) stats.push(`**Active:** ${q.lastActivityDate}`);
       lines.push(stats.join(' | '));
-      lines.push(`**Tags:** ${q.tags.join(', ')}`);
-      lines.push(`**Link:** ${q.link}`);
+      lines.push(`**Tags:** ${escapeMarkdownInline(q.tags.join(', '))}`);
+      lines.push(`**Link:** ${markdownLink(q.link, q.link)}`);
       lines.push('');
     }
     lines.push(`---\n*${result.attribution}*`);

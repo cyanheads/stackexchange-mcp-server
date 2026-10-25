@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
 export const stackexchangeSearchQuestions = tool('stackexchange_search_questions', {
@@ -142,6 +143,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       .describe('Actionable guidance when results are empty or filtered.'),
   },
   enrichmentTrailer: {
+    notice: { render: (value) => (value === undefined ? '' : `> ${escapeMarkdownInline(value)}`) },
     quotaRemaining: { label: 'Quota Remaining' },
     quotaMax: { label: 'Quota Max' },
   },
@@ -258,7 +260,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
     }
     const lines: string[] = [`**Page ${result.page}**\n`];
     for (const q of result.questions) {
-      lines.push(`## ${q.title}`);
+      lines.push(`## ${escapeMarkdownInline(q.title)}`);
       const stats = [
         `**ID:** ${q.questionId}`,
         `**Score:** ${q.score}`,
@@ -268,9 +270,9 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       if (q.creationDate) stats.push(`**Asked:** ${q.creationDate}`);
       if (q.lastActivityDate) stats.push(`**Active:** ${q.lastActivityDate}`);
       lines.push(stats.join(' | '));
-      lines.push(`**Tags:** ${q.tags.join(', ')}`);
-      lines.push(`**Link:** ${q.link}`);
-      if (q.excerpt) lines.push(`\n${q.excerpt}`);
+      lines.push(`**Tags:** ${escapeMarkdownInline(q.tags.join(', '))}`);
+      lines.push(`**Link:** ${markdownLink(q.link, q.link)}`);
+      if (q.excerpt) lines.push(`\n${escapeMarkdownInline(q.excerpt)}`);
       lines.push('');
     }
     lines.push(`---\n*${result.attribution}*`);

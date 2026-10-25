@@ -15,6 +15,7 @@
  * @module tests/tools/error-contract.wire.test
  */
 
+import { execFileSync } from 'node:child_process';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
@@ -454,7 +455,17 @@ describe('search excerpt on the wire', () => {
       "[Microsoft][SQL Server]Cannot open backup device. I have an asynchronous API which I'm using to connect.",
     );
     // The same prose on the format()-only surface, not just in the JSON one.
-    expect(wireText(result)).toContain(excerpt!);
+    const html = execFileSync(
+      'bun',
+      ['-e', 'console.write(Bun.markdown.html(await Bun.stdin.text()))'],
+      {
+        input: wireText(result),
+        encoding: 'utf8',
+      },
+    );
+    expect(html).toContain(
+      "[Microsoft][SQL Server]Cannot open backup device. I have an asynchronous API which I'm using to connect.",
+    );
   });
 });
 

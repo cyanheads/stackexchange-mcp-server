@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
 export const stackexchangeListSites = tool('stackexchange_list_sites', {
@@ -61,6 +62,7 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
       .describe('Actionable guidance when results are empty or filtered.'),
   },
   enrichmentTrailer: {
+    notice: { render: (value) => (value === undefined ? '' : `> ${escapeMarkdownInline(value)}`) },
     quotaRemaining: { label: 'Quota Remaining' },
     quotaMax: { label: 'Quota Max' },
   },
@@ -157,10 +159,10 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
       `**${result.totalCount} site${result.totalCount === 1 ? '' : 's'}**\n`,
     ];
     for (const s of result.sites) {
-      lines.push(`## ${s.name}`);
-      lines.push(`**api_site_parameter:** \`${s.apiSiteParameter}\``);
-      lines.push(`**URL:** ${s.siteUrl}`);
-      if (s.audience) lines.push(`**Audience:** ${s.audience}`);
+      lines.push(`## ${escapeMarkdownInline(s.name)}`);
+      lines.push(`**api_site_parameter:** ${escapeMarkdownInline(s.apiSiteParameter)}`);
+      lines.push(`**URL:** ${markdownLink(s.siteUrl, s.siteUrl)}`);
+      if (s.audience) lines.push(`**Audience:** ${escapeMarkdownInline(s.audience)}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];

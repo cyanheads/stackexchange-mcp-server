@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
 /**
@@ -187,10 +188,10 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
 
   format: (result) => {
     const lines: string[] = [];
-    lines.push(`## ${result.displayName}`);
+    lines.push(`## ${escapeMarkdownInline(result.displayName)}`);
     lines.push(`**User ID:** ${result.userId}`);
     lines.push(`**Reputation:** ${result.reputation.toLocaleString()}`);
-    lines.push(`**Profile:** ${result.link}`);
+    lines.push(`**Profile:** ${markdownLink(result.link, result.link)}`);
 
     if (result.badgeCounts) {
       const badges: string[] = [];
@@ -200,8 +201,9 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
       if (badges.length > 0) lines.push(`**Badges:** ${badges.join('  ')}`);
     }
 
-    if (result.location) lines.push(`**Location:** ${result.location}`);
-    if (result.websiteUrl) lines.push(`**Website:** ${result.websiteUrl}`);
+    if (result.location) lines.push(`**Location:** ${escapeMarkdownInline(result.location)}`);
+    if (result.websiteUrl)
+      lines.push(`**Website:** ${markdownLink(result.websiteUrl, result.websiteUrl)}`);
     if (result.creationDate) lines.push(`**Member since:** ${result.creationDate}`);
     if (result.lastAccessDate) lines.push(`**Last seen:** ${result.lastAccessDate}`);
 
@@ -215,7 +217,7 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
     if (result.topTags.length > 0) {
       lines.push('\n### Top Tags');
       for (const t of result.topTags) {
-        const parts: string[] = [`\`${t.tagName}\``];
+        const parts: string[] = [escapeMarkdownInline(t.tagName)];
         if (t.answerScore != null) parts.push(`score: ${t.answerScore}`);
         if (t.answerCount != null) parts.push(`${t.answerCount} answers`);
         lines.push(`- ${parts.join(' · ')}`);

@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
 /**
@@ -377,7 +378,11 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         // or anonymous commenter is missing data, not a fact to render.
         const parts = [`**${c.score >= 0 ? '+' : ''}${c.score}**`];
         if (c.authorName) {
-          parts.push(c.authorLink ? `[${c.authorName}](${c.authorLink})` : c.authorName);
+          parts.push(
+            c.authorLink
+              ? markdownLink(c.authorName, c.authorLink)
+              : escapeMarkdownInline(c.authorName),
+          );
         }
         if (c.creationDate) parts.push(c.creationDate);
         parts.push(`comment ${c.commentId}`);
@@ -390,18 +395,18 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     };
 
     // Question header
-    lines.push(`# ${result.title}`);
+    lines.push(`# ${escapeMarkdownInline(result.title)}`);
     const statParts = [`**Question ID:** ${result.questionId}`, `**Score:** ${result.score}`];
     if (result.answerCount != null) statParts.push(`**Answers:** ${result.answerCount}`);
     if (result.creationDate) statParts.push(`**Asked:** ${result.creationDate}`);
     if (result.lastActivityDate) statParts.push(`**Active:** ${result.lastActivityDate}`);
     lines.push(statParts.join(' | '));
-    lines.push(`**Tags:** ${result.tags.join(', ')}`);
-    lines.push(`**Link:** ${result.link}`);
+    lines.push(`**Tags:** ${escapeMarkdownInline(result.tags.join(', '))}`);
+    lines.push(`**Link:** ${markdownLink(result.link, result.link)}`);
     if (result.authorName) {
       const authorRef = result.authorLink
-        ? `[${result.authorName}](${result.authorLink})`
-        : result.authorName;
+        ? markdownLink(result.authorName, result.authorLink)
+        : escapeMarkdownInline(result.authorName);
       const userIdSuffix = result.authorUserId != null ? ` (user_id: ${result.authorUserId})` : '';
       lines.push(`**Author:** ${authorRef}${userIdSuffix}`);
     }
@@ -432,7 +437,9 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         if (a.creationDate) attrParts.push(`**Posted:** ${a.creationDate}`);
         if (a.lastActivityDate) attrParts.push(`**Active:** ${a.lastActivityDate}`);
         if (a.authorName) {
-          const authorRef = a.authorLink ? `[${a.authorName}](${a.authorLink})` : a.authorName;
+          const authorRef = a.authorLink
+            ? markdownLink(a.authorName, a.authorLink)
+            : escapeMarkdownInline(a.authorName);
           const userIdSuffix = a.authorUserId != null ? ` (user_id: ${a.authorUserId})` : '';
           attrParts.push(`**Author:** ${authorRef}${userIdSuffix}`);
           if (a.authorReputation != null) {
