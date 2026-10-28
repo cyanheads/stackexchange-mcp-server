@@ -10,6 +10,7 @@ import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   configurationError,
   forbidden,
+  JsonRpcErrorCode,
   McpError,
   notFound,
   rateLimited,
@@ -17,7 +18,12 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createPacer, fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  createPacer,
+  fetchWithTimeout,
+  type RetryAttempt,
+  withRetry,
+} from '@cyanheads/mcp-ts-core/utils';
 import { decodeHtmlEntities, normalizeHtml } from './html-normalizer.js';
 import type {
   SeAnswer,
@@ -34,6 +40,12 @@ const BASE_URL = 'https://api.stackexchange.com/2.3';
 const REQUEST_TIMEOUT_MS = 30_000;
 /** Leave headroom within a typical 60-second client timeout, including queue and backoff. */
 const OPERATION_DEADLINE_MS = 50_000;
+/**
+ * How far ahead of the operation deadline every wait inside an attempt must
+ * end, so a queue shed or a throttle refusal lands before `withRetry`'s own
+ * deadline timer fires and relabels the failure `retry_deadline_exceeded`.
+ */
+const DEADLINE_MARGIN_MS = 1_000;
 
 /** Page size for the /sites walk — 100 is the SE maximum. */
 const SITES_PAGE_SIZE = 100;
@@ -289,6 +301,8 @@ const questionIdOrParameter: BadParameterMapping = (field) =>
  * Raise the calling tool's `quota_exceeded` error once SE reports the daily
  * quota spent. SE answers HTTP 200 with `quota_remaining: 0` rather than a
  * rate-limit status, so every domain method checks the envelope itself.
+ * Non-retryable: a re-send draws a throttle against the same spent quota and
+ * discards the page SE already served.
  */
 function assertQuotaRemaining(
   wrapper: Pick<SeWrapper<unknown>, 'quota_max' | 'quota_remaining'>,
@@ -296,9 +310,59 @@ function assertQuotaRemaining(
   if (wrapper.quota_remaining !== 0) return;
   throw rateLimited('Stack Exchange API quota exhausted.', {
     reason: 'quota_exceeded',
+    retryable: false,
     quota_remaining: 0,
     quota_max: wrapper.quota_max,
   });
+}
+
+/** The wait a `throttle_violation` message states: "…more requests available in N seconds". */
+const THROTTLE_WAIT_SECONDS = /available in (\d+) seconds?/i;
+
+/** Seconds a `Retry-After` header value names, as delta-seconds or an HTTP-date. */
+function retryAfterSeconds(header: unknown): number | undefined {
+  if (typeof header !== 'string') return;
+  const value = header.trim();
+  if (/^\d+$/.test(value)) return Number(value);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.ceil((at - Date.now()) / 1000);
+}
+
+/**
+ * Stack Exchange is throttling this server's IP: a `throttle_violation`
+ * envelope, an HTTP 429, or a backoff window longer than the call can wait.
+ * The wait rides `retryAfter` (whole seconds, at least 1) and the message, so
+ * format()-only clients see it too. An unknown wait is left off here and filled
+ * by `fetchSe` from the pacer's cooldown gate.
+ */
+function throttled(
+  retryAfter: number | undefined,
+  data: Record<string, unknown> = {},
+  cause?: unknown,
+): McpError {
+  const seconds = retryAfter === undefined ? undefined : Math.max(1, retryAfter);
+  return rateLimited(
+    seconds === undefined
+      ? 'Stack Exchange is throttling requests from this server.'
+      : `Stack Exchange is throttling requests from this server; retry in ${seconds} seconds.`,
+    { ...data, reason: 'throttled', ...(seconds !== undefined && { retryAfter: seconds }) },
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+/** One `withRetry` attempt as `fetchSe` needs it. */
+interface SeAttempt {
+  /** The instant every wait in the attempt — queue, backoff — must end by. */
+  readonly deadlineAt: number;
+  readonly signal: AbortSignal;
+}
+
+/**
+ * Hold the attempt's remaining budget as an absolute instant, so every chained
+ * request in it draws on one deadline rather than restarting a duration.
+ */
+function seAttempt({ signal, remainingMs }: RetryAttempt): SeAttempt {
+  return { signal, deadlineAt: Date.now() + remainingMs - DEADLINE_MARGIN_MS };
 }
 
 export interface SearchQuestionsOptions {
@@ -317,6 +381,12 @@ export interface SearchQuestionsOptions {
 
 export interface GetThreadOptions {
   apiKey?: string;
+  /**
+   * Site to read from instead when Stack Exchange answers `site` with "No site
+   * found" — one more request, inside the same attempt and deadline. Later
+   * attempts read from it directly.
+   */
+  fallbackSite?: string;
   includeComments?: boolean;
   maxAnswers?: number;
   questionId: number;
@@ -513,6 +583,8 @@ function takeComments(items: SeComment[], pageHasMore: boolean): CommentState {
 export class StackExchangeService {
   private readonly apiKey: string | undefined;
   private backoffUntil = 0;
+  /** Re-checks for calls waiting in the queue, run whenever the backoff window grows. */
+  private readonly backoffListeners = new Set<() => void>();
   private readonly pacer = createPacer({
     name: 'stackexchange',
     maxConcurrent: 1,
@@ -550,21 +622,86 @@ export class StackExchangeService {
   /**
    * Fetch, decompress (auto), parse, handle errors. `badParameter` maps a
    * non-site `bad_parameter` rejection onto the calling tool's own contract.
+   *
+   * Every wait is held to `attempt.deadlineAt`. A backoff window that outlasts
+   * it fails `throttled` at once instead of being slept, and the queue wait is
+   * the pacer's `maxWaitMs`, so a queued call sheds with `pacer_shed`. Waits
+   * that fit are still taken.
    */
-  private fetchSe<T>(
+  private async fetchSe<T>(
     url: string,
     ctx: Context,
-    signal: AbortSignal,
+    attempt: SeAttempt,
     badParameter: BadParameterMapping = invalidParameter,
   ): Promise<SeWrapper<T>> {
-    return this.pacer.run(
-      async () => {
-        const waitMs = this.backoffUntil - Date.now();
-        if (waitMs > 0) await sleep(waitMs, undefined, { signal });
-        return this.fetchEnvelope<T>(url, ctx, signal, badParameter);
-      },
-      { signal },
-    );
+    this.assertBackoffFits(attempt.deadlineAt);
+    /**
+     * A backoff that lands while this call waits in the queue, and outlasts its
+     * deadline, takes it out of the queue at once. Only the queue wait listens:
+     * the task runs on the attempt's own signal, so the slot holder whose
+     * response set the window is unaffected.
+     */
+    const refusal = new AbortController();
+    const onBackoff = () => {
+      try {
+        this.assertBackoffFits(attempt.deadlineAt);
+      } catch (error) {
+        refusal.abort(error);
+      }
+    };
+    this.backoffListeners.add(onBackoff);
+    try {
+      return await this.pacer.run(
+        async () => {
+          const waitMs = this.backoffUntil - Date.now();
+          if (waitMs > 0) await sleep(waitMs, undefined, { signal: attempt.signal });
+          return await this.fetchEnvelope<T>(url, ctx, attempt.signal, badParameter);
+        },
+        {
+          signal: AbortSignal.any([attempt.signal, refusal.signal]),
+          maxWaitMs: Math.max(0, attempt.deadlineAt - Date.now()),
+        },
+      );
+    } catch (error) {
+      throw this.withStatedWait(error);
+    } finally {
+      this.backoffListeners.delete(onBackoff);
+    }
+  }
+
+  /** Refuse, as `throttled`, a backoff window that outlasts the attempt's deadline. */
+  private assertBackoffFits(deadlineAt: number): void {
+    const now = Date.now();
+    if (this.backoffUntil <= Math.max(deadlineAt, now)) return;
+    throw throttled(Math.ceil((this.backoffUntil - now) / 1000));
+  }
+
+  /** Hold every later request until `seconds` from now, and re-check queued calls. */
+  private extendBackoff(seconds: number): void {
+    const until = Date.now() + seconds * 1000;
+    if (until <= this.backoffUntil) return;
+    this.backoffUntil = until;
+    for (const listener of this.backoffListeners) listener();
+  }
+
+  /**
+   * Name the wait on a throttle or a queue shed in its message, which is all a
+   * format()-only client reads. A throttle that stated no wait takes the
+   * cooldown gate, which the pacer has closed by the time the task's rejection
+   * arrives here. Anything else — a caller abort included — passes untouched.
+   */
+  private withStatedWait(error: unknown): unknown {
+    if (!(error instanceof McpError) || error.code !== JsonRpcErrorCode.RateLimited) return error;
+    const data = error.data ?? {};
+    if (data.reason === 'throttled' && data.retryAfter === undefined) {
+      return throttled(Math.ceil(this.pacer.cooldown.remainingMs / 1000), data, error.cause);
+    }
+    if (data.reason === 'pacer_shed') {
+      return rateLimited(`${error.message} Retry in ${String(data.retryAfter)} seconds.`, data, {
+        cause: error,
+      });
+    }
+    return error;
   }
 
   /** Hold the pacer slot until the body has updated the shared backoff window. */
@@ -582,10 +719,16 @@ export class StackExchangeService {
           Accept: 'application/json',
         },
         signal,
-        expectedStatuses: [400],
+        expectedStatuses: [400, 429],
       });
     } catch (error) {
-      // SE returns HTTP 400 with a JSON error envelope for bad parameters.
+      // A bare 429. A wait it names in Retry-After holds every later request.
+      if (error instanceof McpError && error.data?.status === 429) {
+        const seconds = retryAfterSeconds(error.data.retryAfter);
+        if (seconds !== undefined) this.extendBackoff(seconds);
+        throw throttled(seconds, { status: 429 }, error);
+      }
+      // SE returns HTTP 400 with a JSON error envelope for every method error.
       if (
         error instanceof McpError &&
         error.data?.status === 400 &&
@@ -597,6 +740,27 @@ export class StackExchangeService {
         } catch {
           // Preserve the framework-classified HTTP error when the body is not JSON.
         }
+        const envelope = { error_name: errObj?.error_name, error_id: errObj?.error_id };
+        if (errObj?.error_name === 'throttle_violation') {
+          // The message names the wait — hours once the IP's daily quota is
+          // spent — else Retry-After may; either holds every later request.
+          const stated = THROTTLE_WAIT_SECONDS.exec(errObj.error_message)?.[1];
+          const seconds =
+            stated === undefined ? retryAfterSeconds(error.data.retryAfter) : Number(stated);
+          if (seconds !== undefined) this.extendBackoff(seconds);
+          throw throttled(seconds, envelope, error);
+        }
+        // SE's own 503 and 500, wrapped in HTTP 400: transient, retried like a 5xx.
+        if (
+          errObj?.error_name === 'temporarily_unavailable' ||
+          errObj?.error_name === 'internal_error'
+        ) {
+          throw serviceUnavailable(
+            `Stack Exchange could not serve the request: ${errObj.error_message}`,
+            { reason: 'upstream_unavailable', ...envelope },
+            { cause: error },
+          );
+        }
         // Paging past the keyless depth ceiling. SE answers HTTP 400 — the same
         // status `bad_parameter` uses — with `error_name: access_denied` and an
         // `error_id` of 403 in the envelope, so the status cannot separate the
@@ -606,8 +770,7 @@ export class StackExchangeService {
         if (errObj?.error_name === 'access_denied' && /\bpage\b/i.test(errObj.error_message)) {
           throw forbidden(`Stack Exchange refused the request: ${errObj.error_message}`, {
             reason: 'paging_depth_limit',
-            error_name: errObj.error_name,
-            error_id: errObj.error_id,
+            ...envelope,
           });
         }
         if (errObj?.error_name === 'bad_parameter') {
@@ -620,11 +783,7 @@ export class StackExchangeService {
           if (UNRECOGNIZED_KEY_MESSAGE.test(errObj.error_message)) {
             throw configurationError(
               'Stack Exchange did not recognize the API key this server is configured with — STACKEXCHANGE_API_KEY is not a registered Stack Apps key.',
-              {
-                reason: 'invalid_api_key',
-                error_name: errObj.error_name,
-                error_id: errObj.error_id,
-              },
+              { reason: 'invalid_api_key', ...envelope },
             );
           }
           // SE answers an unknown site with prose ("No site found for name `x`")
@@ -637,11 +796,7 @@ export class StackExchangeService {
             detail === 'site' || /^no site found/i.test(detail)
               ? { reason: 'invalid_site', message: `Stack Exchange API error: ${detail}` }
               : badParameter(detail);
-          throw validationError(message, {
-            reason,
-            error_name: errObj.error_name,
-            error_id: errObj.error_id,
-          });
+          throw validationError(message, { reason, ...envelope });
         }
       }
       throw error;
@@ -660,9 +815,7 @@ export class StackExchangeService {
       );
     }
 
-    if (wrapper.backoff && wrapper.backoff > 0) {
-      this.backoffUntil = Math.max(this.backoffUntil, Date.now() + wrapper.backoff * 1000);
-    }
+    if (wrapper.backoff && wrapper.backoff > 0) this.extendBackoff(wrapper.backoff);
 
     ctx.log.debug('SE quota', {
       quota_remaining: wrapper.quota_remaining,
@@ -672,7 +825,12 @@ export class StackExchangeService {
     return wrapper;
   }
 
-  /** Search questions (no bodies). */
+  /**
+   * Search questions (no bodies). `appliedSort` is the ordering the results
+   * carry, in the `sort` option's own vocabulary (`newest`, never SE's
+   * `creation`); it differs from the requested sort only when minScore forced
+   * `votes`.
+   */
   searchQuestions(
     opts: SearchQuestionsOptions,
     ctx: Context,
@@ -681,25 +839,21 @@ export class StackExchangeService {
     quotaRemaining: number;
     quotaMax: number;
     hasMore: boolean;
+    appliedSort: NonNullable<SearchQuestionsOptions['sort']>;
   }> {
-    return withRetry(
-      async ({ signal }) => {
-        /**
-         * Resolve one effective SE sort. SE `min` constrains the current sort
-         * field (not score), so a minScore filter forces `votes` — its only
-         * score-sorted mode; otherwise it errors under `relevance` or filters by
-         * date under `activity`. Without minScore, the `newest` facade maps to
-         * SE's `creation` (SE accepts only activity|creation|votes|relevance);
-         * every other value passes through 1:1.
-         */
-        const requestedSort = opts.sort ?? 'relevance';
-        const sort =
-          opts.minScore !== undefined
-            ? 'votes'
-            : requestedSort === 'newest'
-              ? 'creation'
-              : requestedSort;
+    /**
+     * SE `min` constrains the current sort field (not score), so a minScore
+     * filter forces `votes` — its only score-sorted mode; otherwise it errors
+     * under `relevance` or filters by date under `activity`. The `newest`
+     * facade then maps to SE's `creation` (SE accepts only
+     * activity|creation|votes|relevance); every other value passes through 1:1.
+     */
+    const appliedSort = opts.minScore !== undefined ? 'votes' : (opts.sort ?? 'relevance');
+    const sort = appliedSort === 'newest' ? 'creation' : appliedSort;
 
+    return withRetry(
+      async (retry) => {
+        const attempt = seAttempt(retry);
         const params: Record<string, string | number | boolean | undefined> = {
           site: opts.site,
           q: opts.query,
@@ -719,7 +873,7 @@ export class StackExchangeService {
         }
 
         const url = this.buildUrl('/search/advanced', params);
-        const wrapper = await this.fetchSe<SeQuestion>(url, ctx, signal);
+        const wrapper = await this.fetchSe<SeQuestion>(url, ctx, attempt);
 
         assertQuotaRemaining(wrapper);
 
@@ -730,6 +884,7 @@ export class StackExchangeService {
           quotaRemaining: wrapper.quota_remaining,
           quotaMax: wrapper.quota_max,
           hasMore: wrapper.has_more,
+          appliedSort,
         };
       },
       {
@@ -742,7 +897,10 @@ export class StackExchangeService {
     );
   }
 
-  /** Fetch a complete Q&A thread with HTML→markdown normalization. */
+  /**
+   * Fetch a complete Q&A thread with HTML→markdown normalization. `siteUsed` is
+   * `fallbackSite` when Stack Exchange did not recognize `site`, else `site`.
+   */
   getThread(
     opts: GetThreadOptions,
     ctx: Context,
@@ -750,41 +908,53 @@ export class StackExchangeService {
     thread: NormalizedThread;
     quotaRemaining: number;
     quotaMax: number;
+    siteUsed: string;
   }> {
+    // Outlives the attempt: once Stack Exchange has refused `site`, a retry goes
+    // straight to the fallback instead of sending the refused site again.
+    let site = opts.site;
     return withRetry(
-      async ({ signal }) => {
-        const questionUrl = this.buildUrl(`/questions/${opts.questionId}`, {
-          site: opts.site,
-          filter: 'withbody',
+      async (retry) => {
+        const attempt = seAttempt(retry);
+        const fetchQuestion = (site: string) =>
+          this.fetchSe<SeQuestion>(
+            this.buildUrl(`/questions/${opts.questionId}`, { site, filter: 'withbody' }),
+            ctx,
+            attempt,
+            questionIdOrParameter,
+          );
+
+        const questionWrapper = await fetchQuestion(site).catch((error: unknown) => {
+          const fallback = opts.fallbackSite;
+          const unknownSite = error instanceof McpError && error.data?.reason === 'invalid_site';
+          if (fallback === undefined || site === fallback || !unknownSite) throw error;
+          site = fallback;
+          return fetchQuestion(fallback);
         });
+
         const answersUrl = this.buildUrl(`/questions/${opts.questionId}/answers`, {
-          site: opts.site,
+          site,
           filter: 'withbody',
           sort: 'votes',
           pagesize: opts.maxAnswers ?? 10,
         });
+        // Before the next request: one sent against a spent quota draws a
+        // throttle_violation, which would surface as `throttled` instead.
+        assertQuotaRemaining(questionWrapper);
 
-        const questionWrapper = await this.fetchSe<SeQuestion>(
-          questionUrl,
-          ctx,
-          signal,
-          questionIdOrParameter,
-        );
         const answersWrapper = await this.fetchSe<SeAnswer>(
           answersUrl,
           ctx,
-          signal,
+          attempt,
           questionIdOrParameter,
         );
 
-        assertQuotaRemaining(questionWrapper);
-
         const q = questionWrapper.items[0];
         if (!q) {
-          throw notFound(`Question ID ${opts.questionId} not found on site "${opts.site}".`, {
+          throw notFound(`Question ID ${opts.questionId} not found on site "${site}".`, {
             reason: 'question_not_found',
             questionId: opts.questionId,
-            site: opts.site,
+            site,
           });
         }
 
@@ -798,12 +968,12 @@ export class StackExchangeService {
           !answerItems.some((a) => a.answer_id === q.accepted_answer_id)
         ) {
           const acceptedUrl = this.buildUrl(`/answers/${q.accepted_answer_id}`, {
-            site: opts.site,
+            site,
             filter: 'withbody',
           });
           // Default mapping, not questionIdOrParameter: `ids` on /answers/{id}
           // is the answer ID SE itself reported, never the caller's input.
-          const acceptedWrapper = await this.fetchSe<SeAnswer>(acceptedUrl, ctx, signal);
+          const acceptedWrapper = await this.fetchSe<SeAnswer>(acceptedUrl, ctx, attempt);
           const acceptedAnswer = acceptedWrapper.items[0];
           if (acceptedAnswer) {
             answerItems.push(acceptedAnswer);
@@ -828,7 +998,7 @@ export class StackExchangeService {
 
         if (opts.includeComments) {
           const commentParams = {
-            site: opts.site,
+            site,
             filter: 'withbody',
             // SE's own default order. Newest-first is what surfaces the
             // corrections that make an old answer stale; sorting by votes would
@@ -851,12 +1021,12 @@ export class StackExchangeService {
           const questionCommentsWrapper = await this.fetchSe<SeComment>(
             questionCommentsUrl,
             ctx,
-            signal,
+            attempt,
             questionIdOrParameter,
           );
           // Answer IDs came from SE; they are not the caller's question ID.
           const answerCommentsWrapper = answerCommentsUrl
-            ? await this.fetchSe<SeComment>(answerCommentsUrl, ctx, signal)
+            ? await this.fetchSe<SeComment>(answerCommentsUrl, ctx, attempt)
             : undefined;
 
           questionComments = takeComments(
@@ -926,6 +1096,7 @@ export class StackExchangeService {
           thread,
           quotaRemaining: questionWrapper.quota_remaining,
           quotaMax: questionWrapper.quota_max,
+          siteUsed: site,
         };
       },
       {
@@ -938,7 +1109,7 @@ export class StackExchangeService {
     );
   }
 
-  /** Fetch the tag FAQ (highest-voted answered questions for a tag). */
+  /** Fetch the tag FAQ — Stack Exchange's "frequently asked" selection for a tag, in its order. */
   getTagFaq(
     opts: GetTagFaqOptions,
     ctx: Context,
@@ -949,13 +1120,14 @@ export class StackExchangeService {
     hasMore: boolean;
   }> {
     return withRetry(
-      async ({ signal }) => {
+      async (retry) => {
+        const attempt = seAttempt(retry);
         const url = this.buildUrl(`/tags/${encodeURIComponent(opts.tag)}/faq`, {
           site: opts.site,
           pagesize: opts.pageSize ?? 10,
           page: opts.page,
         });
-        const wrapper = await this.fetchSe<SeQuestion>(url, ctx, signal);
+        const wrapper = await this.fetchSe<SeQuestion>(url, ctx, attempt);
 
         assertQuotaRemaining(wrapper);
 
@@ -988,7 +1160,8 @@ export class StackExchangeService {
     quotaMax: number;
   }> {
     return withRetry(
-      async ({ signal }) => {
+      async (retry) => {
+        const attempt = seAttempt(retry);
         const profileUrl = this.buildUrl(`/users/${opts.userId}`, {
           site: opts.site,
           filter: SE_USER_FILTER,
@@ -998,10 +1171,10 @@ export class StackExchangeService {
           pagesize: 10,
         });
 
-        const profileWrapper = await this.fetchSe<SeUser>(profileUrl, ctx, signal);
-        const topTagsWrapper = await this.fetchSe<SeTopTag>(topTagsUrl, ctx, signal);
-
+        const profileWrapper = await this.fetchSe<SeUser>(profileUrl, ctx, attempt);
+        // Before the next request, as in getThread.
         assertQuotaRemaining(profileWrapper);
+        const topTagsWrapper = await this.fetchSe<SeTopTag>(topTagsUrl, ctx, attempt);
 
         const u = profileWrapper.items[0];
         if (!u) {
@@ -1062,7 +1235,8 @@ export class StackExchangeService {
     truncated: boolean;
   }> {
     return withRetry(
-      async ({ signal }) => {
+      async (retry) => {
+        const attempt = seAttempt(retry);
         // SE API returns site names and audiences HTML-encoded (e.g. "Unix &amp; Linux")
         const normalizeSite = (s: SeSite): NormalizedSite => ({
           name: decodeHtmlEntities(s.name),
@@ -1082,7 +1256,7 @@ export class StackExchangeService {
           const wrapper = await this.fetchSe<SeSite>(
             this.buildUrl('/sites', { pagesize: SITES_PAGE_SIZE, page }),
             ctx,
-            signal,
+            attempt,
           );
           assertQuotaRemaining(wrapper);
           return wrapper;

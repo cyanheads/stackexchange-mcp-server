@@ -230,6 +230,65 @@ describe('StackExchangeService.searchQuestions sort/min mapping', () => {
       expect(url.searchParams.get('min')).toBeNull();
     },
   );
+
+  it.each([
+    { sort: undefined, minScore: undefined, seSort: 'relevance', appliedSort: 'relevance' },
+    { sort: 'relevance', minScore: undefined, seSort: 'relevance', appliedSort: 'relevance' },
+    { sort: 'votes', minScore: undefined, seSort: 'votes', appliedSort: 'votes' },
+    { sort: 'activity', minScore: undefined, seSort: 'activity', appliedSort: 'activity' },
+    { sort: 'newest', minScore: undefined, seSort: 'creation', appliedSort: 'newest' },
+    { sort: 'relevance', minScore: 5, seSort: 'votes', appliedSort: 'votes' },
+    { sort: 'votes', minScore: 5, seSort: 'votes', appliedSort: 'votes' },
+    { sort: 'activity', minScore: 5, seSort: 'votes', appliedSort: 'votes' },
+    { sort: 'newest', minScore: 0, seSort: 'votes', appliedSort: 'votes' },
+  ] as const)(
+    'sort=$sort minScore=$minScore sends sort=$seSort and reports appliedSort=$appliedSort',
+    async ({ sort, minScore, seSort, appliedSort }) => {
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockRejectedValue(new Error('unmocked fetch'))
+        .mockImplementationOnce(async () => jsonResponse(searchWrapper));
+      const result = await makeService().searchQuestions(
+        {
+          query: 'q',
+          site: 'stackoverflow',
+          ...(sort !== undefined ? { sort } : {}),
+          ...(minScore !== undefined ? { minScore } : {}),
+        },
+        createMockContext(),
+      );
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      expect(new URL(String(fetchSpy.mock.calls[0]![0])).searchParams.get('sort')).toBe(seSort);
+      expect(result.appliedSort).toBe(appliedSort);
+    },
+  );
+
+  it('reports the applied sort after a transient failure is retried', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockRejectedValue(new Error('unmocked fetch'))
+        .mockImplementationOnce(async () => new Response('unavailable', { status: 503 }))
+        .mockImplementationOnce(async () =>
+          jsonResponse({ ...searchWrapper, items: [{ question_id: 1, title: 't', link: 'l' }] }),
+        );
+      const pending = makeService().searchQuestions(
+        { query: 'q', site: 'stackoverflow', sort: 'newest', minScore: 3 },
+        createMockContext(),
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      const result = await pending;
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      for (const [input] of fetchSpy.mock.calls) {
+        expect(new URL(String(input)).searchParams.get('sort')).toBe('votes');
+      }
+      expect(result.questions.map((q) => q.questionId)).toEqual([1]);
+      expect(result.appliedSort).toBe('votes');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('StackExchangeService.getThread accepted-answer merge', () => {

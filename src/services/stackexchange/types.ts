@@ -14,7 +14,7 @@ export interface SeWrapper<T> {
   quota_remaining: number;
 }
 
-/** SE API error response (HTTP 400/500). */
+/** SE API error envelope — SE answers every method error with HTTP 400. */
 export interface SeError {
   error_id: number;
   error_message: string;

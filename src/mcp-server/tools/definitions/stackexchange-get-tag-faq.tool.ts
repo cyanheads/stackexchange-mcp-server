@@ -1,5 +1,5 @@
 /**
- * @fileoverview Tool to fetch the highest-voted answered questions for a tag (tag FAQ).
+ * @fileoverview Tool to fetch a tag's frequently asked questions (tag FAQ), in Stack Exchange's order.
  * @module mcp-server/tools/definitions/stackexchange-get-tag-faq
  */
 
@@ -11,11 +11,7 @@ import { getStackExchangeService } from '@/services/stackexchange/stackexchange-
 export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
   title: 'Get Stack Exchange Tag FAQ',
   description:
-    'Fetch the highest-voted answered questions for a tag on a Stack Exchange site — the canonical "best answers in X" list. ' +
-    'Returns a question list without bodies; use stackexchange_get_thread to read the full body and answers for any result. ' +
-    'Results past the pageSize cap are reachable with the `page` parameter. ' +
-    'Use this tool to find the authoritative community resources on a topic (e.g. tag "javascript" on stackoverflow). ' +
-    'Use stackexchange_search_questions for free-text search rather than tag-based browsing.',
+    'Fetch the frequently asked questions for a tag on a Stack Exchange site — Stack Exchange\'s own "frequently asked" selection, returned in its order, not ranked by score; compare the scores yourself. Returns a question list without bodies; use stackexchange_get_thread to read the full body and answers for any result. Results past the pageSize cap are reachable with the `page` parameter. Use this tool to find the questions a community keeps coming back to on a topic (e.g. tag "javascript" on stackoverflow). Use stackexchange_search_questions for free-text search rather than tag-based browsing.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -29,8 +25,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       .string()
       .default('stackoverflow')
       .describe(
-        'Stack Exchange site — use the api_site_parameter value (e.g. "stackoverflow", "superuser"). ' +
-          'Defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
+        'Stack Exchange site — the api_site_parameter (e.g. "stackoverflow", "superuser") or the site\'s domain (e.g. "superuser.com"). Defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
       ),
     pageSize: z
       .number()
@@ -86,9 +81,11 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
           })
           .describe('A Stack Exchange FAQ question with score, answer count, tags, and dates.'),
       )
-      .describe('Highest-voted answered questions for the specified tag, ordered by votes.'),
+      .describe(
+        "The frequently asked questions for the specified tag, in Stack Exchange's order — not sorted by score.",
+      ),
     tag: z.string().describe('Tag name used for this FAQ lookup.'),
-    site: z.string().describe('Stack Exchange site api_site_parameter used for this lookup.'),
+    site: z.string().describe('Stack Exchange site used for this lookup, as passed in site.'),
     page: z
       .number()
       .int()
@@ -140,8 +137,25 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: 'The Stack Exchange API quota_remaining has reached 0.',
+      retryable: false,
       recovery:
         'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
+    },
+    {
+      reason: 'throttled',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      recovery:
+        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+    },
+    {
+      reason: 'pacer_shed',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
+      recovery:
+        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
     },
     {
       reason: 'paging_depth_limit',
@@ -163,7 +177,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       reason: 'upstream_unavailable',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      when: 'Stack Exchange reported itself temporarily unavailable or failing internally, or answered with a body that is not the expected JSON envelope.',
       recovery:
         'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
     },

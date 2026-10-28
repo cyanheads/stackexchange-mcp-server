@@ -1,7 +1,9 @@
 /**
  * @fileoverview Tests for the stackexchange_get_thread tool.
- * Covers accepted-answer-first ordering, URL parsing, question-not-found (empty items[]),
- * invalid ID/URL, sparse upstream payloads (no author, no acceptedAnswerId), and format().
+ * Covers accepted-answer-first ordering, URL parsing and the site a URL carries,
+ * question-not-found (empty items[]), invalid ID/URL, sparse upstream payloads
+ * (no author, no acceptedAnswerId), and format(). The upstream `site` parameter
+ * per URL shape is asserted against the real service in error-contract.wire.test.ts.
  * @module tests/tools/stackexchange-get-thread.tool.test
  */
 
@@ -85,8 +87,14 @@ const makeComment = (overrides: FixtureOverrides<NormalizedComment> = {}): Norma
     ...overrides,
   });
 
+/** A service stand-in that reads every thread from the site it was asked for. */
 const makeThreadResult = (thread = makeThread()) => ({
-  getThread: vi.fn().mockResolvedValue({ thread, quotaRemaining: 250, quotaMax: 300 }),
+  getThread: vi.fn(async (opts: { site: string }) => ({
+    thread,
+    quotaRemaining: 250,
+    quotaMax: 300,
+    siteUsed: opts.site,
+  })),
 });
 
 /** The rendered `content[]` surface for one thread. */
@@ -119,8 +127,45 @@ describe('stackexchangeGetThread handler', () => {
     });
     await stackexchangeGetThread.handler(input, ctx);
     expect(svc.getThread).toHaveBeenCalledWith(
-      expect.objectContaining({ questionId: 11227809 }),
+      expect.objectContaining({ questionId: 11227809, site: 'stackoverflow.com' }),
       ctx,
+    );
+  });
+
+  it.each([
+    ['11227809', '', 'stackoverflow'],
+    ['11227809', '   ', 'stackoverflow'],
+    ['https://unix.stackexchange.com/questions/88490', '', 'unix.stackexchange.com'],
+  ])(
+    'treats a blank site from a form client as unset (%s, %j)',
+    async (questionIdOrUrl, site, sent) => {
+      const svc = makeThreadResult();
+      mockService(svc);
+      const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+      const input = stackexchangeGetThread.input.parse({ questionIdOrUrl, site });
+      await stackexchangeGetThread.handler(input, ctx);
+      expect(svc.getThread).toHaveBeenCalledWith(expect.objectContaining({ site: sent }), ctx);
+    },
+  );
+
+  it.each([
+    [undefined, false],
+    ['', false],
+    ['stackoverflow', true],
+  ])('reports site %j beside a Unix & Linux URL as ignored: %s', async (site, ignored) => {
+    mockService(
+      makeThreadResult(makeThread({ link: 'https://unix.stackexchange.com/questions/88490' })),
+    );
+    const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
+    const enrichSpy = vi.spyOn(ctx, 'enrich');
+    const input = stackexchangeGetThread.input.parse({
+      questionIdOrUrl: 'https://unix.stackexchange.com/questions/88490',
+      ...(site === undefined ? {} : { site }),
+    });
+    await stackexchangeGetThread.handler(input, ctx);
+    const enriched = Object.assign({}, ...enrichSpy.mock.calls.map(([fields]) => fields));
+    expect(enriched.siteConflict).toEqual(
+      ignored ? { resolvedBy: 'url_host', urlHost: 'unix.stackexchange.com', site } : undefined,
     );
   });
 

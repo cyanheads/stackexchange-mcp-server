@@ -8,27 +8,80 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
+/** The site a numeric question ID is read from when the caller names none. */
+const DEFAULT_SITE = 'stackoverflow';
+
+/** The first `/questions/{id}` anywhere in the input. */
+const QUESTION_REF = /\/questions\/(\d+)/;
+
 /**
- * Parse a question ID from either a numeric string or a Stack Exchange question URL.
- * Returns null if the input cannot be parsed as a valid SE question ID.
+ * The authority directly in front of that reference — after `//`, or, when no
+ * scheme was written, after the start of the text, whitespace, `<`, `(` or `[`.
+ * Anchored at the end, so wrapped forms (`<https://…>`, an archive URL around a
+ * question URL, `see unix.stackexchange.com/questions/…`) yield the host the
+ * question path belongs to. The capture excludes every delimiter, so each
+ * candidate start scans only to the next one: linear in the input.
  */
-function parseQuestionIdOrUrl(input: string): number | null {
+const AUTHORITY_BEFORE = /(?:^|\/\/|[\s<([])([^\s/?#<>()[\]]+)$/;
+
+/**
+ * A hostname lowercased, without a leading `www.` or the trailing dot of a
+ * fully qualified name — Stack Exchange answers `stackoverflow.com.` with
+ * "No site found".
+ */
+const bareHost = (hostname: string): string =>
+  hostname
+    .toLowerCase()
+    .replace(/^www\./, '')
+    .replace(/\.$/, '');
+
+/**
+ * Parse a numeric question ID, or text holding a question URL into its ID and
+ * the host in front of `/questions/`. Question IDs are per-site, so that host
+ * is the only site the ID is valid on; Stack Exchange resolves it as `site`,
+ * aliases included (`arqade.com`, `programmers.stackexchange.com`), and
+ * rejects one off the network as an unknown site. Text with a `/questions/`
+ * path and no host before it (`/questions/88490`) yields the ID alone. A host
+ * must contain a dot, so `unix/questions/1` is a path, not a host. Returns
+ * null when the text holds no `/questions/{id}`.
+ */
+function parseQuestionIdOrUrl(input: string): { questionId: number; host?: string } | null {
   const trimmed = input.trim();
+  if (/^\d+$/.test(trimmed)) return { questionId: parseInt(trimmed, 10) };
 
-  // Numeric ID directly
-  if (/^\d+$/.test(trimmed)) {
-    return parseInt(trimmed, 10);
-  }
+  const ref = QUESTION_REF.exec(trimmed);
+  if (!ref?.[1]) return null;
+  const questionId = parseInt(ref[1], 10);
+  const authority = AUTHORITY_BEFORE.exec(trimmed.slice(0, ref.index))?.[1];
+  const hostname = authority ? URL.parse(`https://${authority}`)?.hostname : undefined;
+  return hostname?.includes('.') ? { questionId, host: bareHost(hostname) } : { questionId };
+}
 
-  // Full SE question URL: extract the integer immediately after /questions/
-  // Handles: https://stackoverflow.com/questions/11227809/...
-  //          https://stackoverflow.com/questions/11227809/title#answerAnchor
-  const match = trimmed.match(/\/questions\/(\d+)/);
-  if (match?.[1]) {
-    return parseInt(match[1], 10);
-  }
+/**
+ * The `api_site_parameter` of a site's canonical host: the subdomain on
+ * stackexchange.com (`unix.meta.stackexchange.com` → `unix.meta`), the host
+ * less `.com` elsewhere (`ru.stackoverflow.com` → `ru.stackoverflow`), and
+ * mathoverflow.net's hosts as they are. Holds for every site in `/2.3/sites`.
+ */
+function siteParameterOf(host: string): string {
+  if (host.endsWith('.stackexchange.com')) return host.slice(0, -'.stackexchange.com'.length);
+  return host.endsWith('.com') ? host.slice(0, -'.com'.length) : host;
+}
 
-  return null;
+/**
+ * Whether a caller's `site` names the site a URL was read from. Compared with
+ * the URL's own host and with the canonical host of the question `link` Stack
+ * Exchange returned (in either form), so an alias URL beside its site's
+ * current parameter — `arqade.com` with `gaming` — still counts as a match.
+ */
+function namesSameSite(site: string, urlHost: string, link: string): boolean {
+  const value = bareHost(site.trim());
+  const linkHostname = URL.parse(link)?.hostname;
+  const linkHost = linkHostname ? bareHost(linkHostname) : undefined;
+  return (
+    value === urlHost ||
+    (linkHost !== undefined && (value === linkHost || value === siteParameterOf(linkHost)))
+  );
 }
 
 /**
@@ -74,11 +127,7 @@ const commentsDescription = (post: string) =>
 export const stackexchangeGetThread = tool('stackexchange_get_thread', {
   title: 'Get Stack Exchange Q&A Thread',
   description:
-    'Fetch a complete Q&A thread — question body and all answers, accepted answer first then sorted by score, ' +
-    'rendered as clean markdown with fenced code blocks. Accepts an integer question ID or a full Stack Exchange ' +
-    'question URL (e.g. "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster" or ' +
-    '"11227809"). HTML is normalized to markdown automatically; attribution (author + link) included per CC BY-SA 4.0. ' +
-    'Get question IDs from stackexchange_search_questions or stackexchange_get_tag_faq.',
+    'Fetch a complete Q&A thread — question body and all answers, accepted answer first then sorted by score, rendered as clean markdown with fenced code blocks. Accepts a full Stack Exchange question URL, which is read from the site its host names (e.g. "https://unix.stackexchange.com/questions/88490/how-do-i-use-a-heredoc"), or an integer question ID read from site (e.g. "11227809"). HTML is normalized to markdown automatically; attribution (author + link) included per CC BY-SA 4.0. Get question IDs from stackexchange_search_questions or stackexchange_get_tag_faq.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -88,17 +137,13 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     questionIdOrUrl: z
       .string()
       .describe(
-        'Numeric question ID (e.g. "11227809") or a full Stack Exchange question URL ' +
-          '(e.g. "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster"). ' +
-          'The integer immediately following /questions/ is extracted from URLs.',
+        'Numeric question ID (e.g. "11227809") or a full Stack Exchange question URL (e.g. "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster"). A URL carries its own site: the question is read from the URL\'s host, so question IDs from any Stack Exchange site resolve correctly. A URL whose host is not a Stack Exchange site is read from site when one is given, and fails as invalid_site otherwise.',
       ),
     site: z
       .string()
-      .default('stackoverflow')
+      .optional()
       .describe(
-        'Stack Exchange site — use the api_site_parameter value (e.g. "stackoverflow", "superuser"). ' +
-          'Defaults to "stackoverflow". Must match the site where the question lives. ' +
-          'Call stackexchange_list_sites to discover valid values.',
+        'Stack Exchange site a numeric question ID belongs to — the api_site_parameter (e.g. "stackoverflow", "unix") or the site\'s domain (e.g. "unix.stackexchange.com"). Defaults to "stackoverflow". Not needed with a URL, which names its own site: a site naming a different one is ignored, or used when the URL host is not a Stack Exchange site, and either way reported as siteConflict. Call stackexchange_list_sites to discover valid values.',
       ),
     maxAnswers: z
       .number()
@@ -237,10 +282,34 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       .describe(
         'Maximum comments carried per post — a post at this count reports commentsTruncated.',
       ),
+    siteConflict: z
+      .object({
+        resolvedBy: z
+          .enum(['url_host', 'site'])
+          .describe(
+            'Which one the question was read from: "url_host" when site was ignored in favor of the URL\'s own site, "site" when the URL host is not a Stack Exchange site and site was used instead.',
+          ),
+        urlHost: z.string().describe('Host of the question URL.'),
+        site: z.string().describe('The site value passed.'),
+      })
+      .optional()
+      .describe(
+        'Present only when questionIdOrUrl is a URL and site names a different site — says which of the two the question was read from.',
+      ),
   },
   enrichmentTrailer: {
     quotaRemaining: { label: 'Quota Remaining' },
     quotaMax: { label: 'Quota Max' },
+    siteConflict: {
+      render: (value) => {
+        if (value === undefined) return '';
+        const site = escapeMarkdownInline(value.site);
+        const urlHost = escapeMarkdownInline(value.urlHost);
+        return value.resolvedBy === 'url_host'
+          ? `> site "${site}" was ignored — the question was read from ${urlHost}, the site its URL names.`
+          : `> ${urlHost} is not a Stack Exchange site, so the question was read from site "${site}".`;
+      },
+    },
   },
 
   errors: [
@@ -256,15 +325,15 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       reason: 'invalid_site',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The provided site value is not a valid Stack Exchange network site identifier.',
+      when: 'The site value, or the host of a question URL, is not a Stack Exchange network site.',
       recovery:
-        'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',
+        'Pass a question URL from a Stack Exchange site, or call stackexchange_list_sites to discover valid site values and retry.',
     },
     {
       reason: 'invalid_id_or_url',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The input is not a parseable integer ID and not a recognizable SE question URL.',
+      when: 'The input is neither an integer ID nor text holding a /questions/{id} path, or Stack Exchange refused the ID.',
       recovery:
         'Provide a numeric question ID (e.g. "11227809") or a valid Stack Exchange question URL.',
     },
@@ -281,8 +350,25 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: 'The Stack Exchange API quota_remaining has reached 0.',
+      retryable: false,
       recovery:
         'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
+    },
+    {
+      reason: 'throttled',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      recovery:
+        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+    },
+    {
+      reason: 'pacer_shed',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
+      recovery:
+        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
     },
     {
       reason: 'invalid_api_key',
@@ -296,37 +382,64 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       reason: 'upstream_unavailable',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      when: 'Stack Exchange reported itself temporarily unavailable or failing internally, or answered with a body that is not the expected JSON envelope.',
       recovery:
         'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
     },
   ],
 
   async handler(input, ctx) {
-    const questionId = parseQuestionIdOrUrl(input.questionIdOrUrl);
-    if (questionId === null) {
+    const parsed = parseQuestionIdOrUrl(input.questionIdOrUrl);
+    if (parsed === null) {
       throw ctx.fail(
         'invalid_id_or_url',
-        `Cannot parse "${input.questionIdOrUrl}" as a question ID or SE question URL.`,
+        `Cannot parse "${input.questionIdOrUrl}" as a question ID or a Stack Exchange question URL.`,
         { input: input.questionIdOrUrl },
       );
     }
+    const { questionId, host } = parsed;
+
+    // A blank site from a form-based client is unset. `site` is optional rather
+    // than defaulted so an omitted value is never reported as a siteConflict.
+    const requestedSite = input.site?.trim() ? input.site : undefined;
+    const site = host ?? requestedSite ?? DEFAULT_SITE;
+    // A host Stack Exchange does not know (a translation proxy) falls back to the
+    // caller's own site — the request 0.1.17 sent. Without one it stays invalid_site.
+    const fallbackSite =
+      host && requestedSite !== undefined && bareHost(requestedSite.trim()) !== host
+        ? requestedSite
+        : undefined;
 
     const svc = getStackExchangeService();
-    const { thread, quotaRemaining, quotaMax } = await svc.getThread(
+    const { thread, quotaRemaining, quotaMax, siteUsed } = await svc.getThread(
       {
         questionId,
-        site: input.site,
+        site,
+        ...(fallbackSite !== undefined ? { fallbackSite } : {}),
         maxAnswers: input.maxAnswers,
         includeComments: input.includeComments,
       },
       ctx,
     );
 
+    let siteConflict:
+      | { resolvedBy: 'site' | 'url_host'; urlHost: string; site: string }
+      | undefined;
+    if (host && requestedSite !== undefined) {
+      const resolvedBy =
+        siteUsed !== host
+          ? 'site'
+          : namesSameSite(requestedSite, host, thread.link)
+            ? undefined
+            : 'url_host';
+      if (resolvedBy) siteConflict = { resolvedBy, urlHost: host, site: requestedSite };
+    }
+
     ctx.enrich({
       quotaRemaining,
       quotaMax,
       ...(input.includeComments ? { commentsCap: COMMENTS_CAP } : {}),
+      ...(siteConflict ? { siteConflict } : {}),
     });
     if (thread.answers.length < thread.answerCount) {
       ctx.enrich.truncated({ shown: thread.answers.length, cap: input.maxAnswers });
@@ -334,7 +447,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
 
     ctx.log.info('Fetched SE thread', {
       questionId,
-      site: input.site,
+      site: siteUsed,
       answerCount: thread.answers.length,
       includeComments: input.includeComments,
     });

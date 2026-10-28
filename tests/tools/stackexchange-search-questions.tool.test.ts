@@ -3,10 +3,16 @@
  * @module tests/tools/stackexchange-search-questions.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
 import { stackexchangeSearchQuestions } from '@/mcp-server/tools/definitions/stackexchange-search-questions.tool.js';
-import type { NormalizedQuestion } from '@/services/stackexchange/stackexchange-service.js';
+import type {
+  NormalizedQuestion,
+  StackExchangeService,
+} from '@/services/stackexchange/stackexchange-service.js';
 
 // ---------------------------------------------------------------------------
 // Service mock
@@ -51,6 +57,7 @@ const makeSearchResult = (questions: NormalizedQuestion[] = [makeQuestion()], ha
     quotaRemaining: 250,
     quotaMax: 300,
     hasMore,
+    appliedSort: 'relevance',
   }),
 });
 
@@ -459,5 +466,247 @@ describe('stackexchangeSearchQuestions paging', () => {
     expect(entry).toBeDefined();
     expect(entry!.recovery).toContain('STACKEXCHANGE_API_KEY');
     expect(entry!.recovery).toContain('25');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #27 — the sort Stack Exchange applied, through the real service (the sort
+// resolution lives there) and the framework's result shaping (both surfaces)
+// ---------------------------------------------------------------------------
+describe('stackexchangeSearchQuestions applied sort', () => {
+  let service: StackExchangeService;
+  let fetchSpy: MockInstance<typeof fetch>;
+
+  /** A raw /search/advanced item as Stack Exchange ships it. */
+  const seQuestion = (id: number) => ({
+    question_id: id,
+    title: `Question ${id}`,
+    link: `https://stackoverflow.com/q/${id}`,
+    score: 10,
+    answer_count: 1,
+    is_answered: true,
+    tags: ['java'],
+  });
+
+  /** Queue one upstream response; every call past the queue hits the rejecting default. */
+  const respondWith = (ids: number[], hasMore = false): void => {
+    fetchSpy.mockImplementationOnce(
+      async () =>
+        new Response(
+          JSON.stringify({
+            items: ids.map(seQuestion),
+            has_more: hasMore,
+            quota_remaining: 100,
+            quota_max: 300,
+          }),
+        ),
+    );
+  };
+
+  const requestUrl = (): URL => {
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    return new URL(String(fetchSpy.mock.calls[0]![0]));
+  };
+
+  /** content[] text rendered through a CommonMark parser, so assertions read the rendered result, not escapes. */
+  const renderedContent = (result: Awaited<ReturnType<typeof runToolContract>>): string =>
+    execFileSync('bun', ['-e', 'console.write(Bun.markdown.html(await Bun.stdin.text()))'], {
+      input: result.content
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join(''),
+      encoding: 'utf8',
+    });
+
+  /** Text of every rendered block quote, entity-decoded. */
+  const blockquotes = (html: string): string[] =>
+    [...html.matchAll(/<blockquote>\s*<p>([\s\S]*?)<\/p>\s*<\/blockquote>/g)].map((m) =>
+      m[1]!
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'")
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&amp;', '&'),
+    );
+
+  const structured = (result: Awaited<ReturnType<typeof runToolContract>>) => {
+    expect(result.isError).toBeFalsy();
+    return result.structuredContent as Record<string, unknown> & {
+      questions: { questionId: number }[];
+    };
+  };
+
+  beforeEach(async () => {
+    const actual = await vi.importActual<
+      typeof import('@/services/stackexchange/stackexchange-service.js')
+    >('@/services/stackexchange/stackexchange-service.js');
+    service = new actual.StackExchangeService({} as AppConfig, {} as StorageService);
+    mockService(service);
+    fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unmocked fetch'));
+  });
+
+  afterEach(() => {
+    service.dispose();
+    vi.restoreAllMocks();
+  });
+
+  describe('characterization — existing request and output, unchanged by #27', () => {
+    it('sends sort=relevance without min on the default call and keeps upstream order and quota fields', async () => {
+      respondWith([3, 1, 2]);
+      const result = await runToolContract(stackexchangeSearchQuestions, { query: 'q' });
+      const url = requestUrl();
+      expect(url.searchParams.get('sort')).toBe('relevance');
+      expect(url.searchParams.get('min')).toBeNull();
+      const sc = structured(result);
+      expect(sc.questions.map((q) => q.questionId)).toEqual([3, 1, 2]);
+      expect(sc.page).toBe(1);
+      expect(sc.quotaRemaining).toBe(100);
+      expect(sc.quotaMax).toBe(300);
+      const html = renderedContent(result);
+      expect(html).toContain('<strong>Quota Remaining:</strong> 100');
+      expect(html).toContain('<strong>Quota Max:</strong> 300');
+    });
+
+    it('sends sort=votes with min when minScore is set under the activity sort', async () => {
+      respondWith([1]);
+      await runToolContract(stackexchangeSearchQuestions, {
+        query: 'q',
+        sort: 'activity',
+        minScore: 5,
+      });
+      const url = requestUrl();
+      expect(url.searchParams.get('sort')).toBe('votes');
+      expect(url.searchParams.get('min')).toBe('5');
+    });
+
+    it('sends sort=creation for the newest sort', async () => {
+      respondWith([1]);
+      await runToolContract(stackexchangeSearchQuestions, { query: 'q', sort: 'newest' });
+      expect(requestUrl().searchParams.get('sort')).toBe('creation');
+    });
+
+    it('discloses a truncated page with the paging notice', async () => {
+      respondWith([1, 2], true);
+      const result = await runToolContract(stackexchangeSearchQuestions, {
+        query: 'q',
+        pageSize: 2,
+      });
+      const sc = structured(result);
+      expect(sc.truncated).toBe(true);
+      expect(sc.shown).toBe(2);
+      expect(sc.cap).toBe(2);
+      expect(sc.notice).toContain('Request page 2');
+      expect(blockquotes(renderedContent(result))).toEqual([sc.notice]);
+    });
+
+    it('explains an empty first page with the broaden-the-query notice', async () => {
+      respondWith([]);
+      const result = await runToolContract(stackexchangeSearchQuestions, { query: 'xyzzy' });
+      const sc = structured(result);
+      expect(sc.questions).toEqual([]);
+      expect(sc.notice).toContain('Try broader terms');
+      expect(blockquotes(renderedContent(result))).toEqual([sc.notice]);
+    });
+
+    it('rejects a sort outside the tool vocabulary before any request', async () => {
+      const result = await runToolContract(stackexchangeSearchQuestions, {
+        query: 'q',
+        // SE's own spelling of the newest sort — not a value this tool accepts.
+        sort: 'creation' as 'newest',
+      });
+      expect(result.isError).toBe(true);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  const overrideReason = (requested: string) =>
+    `minScore filters on score, which Stack Exchange applies only under the votes sort, so results are ordered by votes instead of "${requested}".`;
+
+  it('reports votes and the override reason on both surfaces when minScore replaces activity', async () => {
+    respondWith([1]);
+    const result = await runToolContract(stackexchangeSearchQuestions, {
+      query: 'q',
+      sort: 'activity',
+      minScore: 5,
+    });
+    const sc = structured(result);
+    expect(sc.appliedSort).toBe('votes');
+    expect(sc.sortOverrideReason).toBe(overrideReason('activity'));
+    const html = renderedContent(result);
+    expect(html).toContain('<strong>Sort:</strong> <code>votes</code>');
+    expect(blockquotes(html)).toEqual([overrideReason('activity')]);
+  });
+
+  it('names the requested sort in the reason when minScore replaces the default relevance sort', async () => {
+    respondWith([1]);
+    const result = await runToolContract(stackexchangeSearchQuestions, { query: 'q', minScore: 5 });
+    const sc = structured(result);
+    expect(sc.appliedSort).toBe('votes');
+    expect(sc.sortOverrideReason).toBe(overrideReason('relevance'));
+    expect(blockquotes(renderedContent(result))).toEqual([overrideReason('relevance')]);
+  });
+
+  it('reports votes with no reason when the caller already asked for votes', async () => {
+    respondWith([1]);
+    const result = await runToolContract(stackexchangeSearchQuestions, {
+      query: 'q',
+      sort: 'votes',
+      minScore: 5,
+    });
+    const sc = structured(result);
+    expect(sc.appliedSort).toBe('votes');
+    expect(sc).not.toHaveProperty('sortOverrideReason');
+    const html = renderedContent(result);
+    expect(html).toContain('<strong>Sort:</strong> <code>votes</code>');
+    expect(blockquotes(html)).toEqual([]);
+  });
+
+  it("reports newest in the tool's vocabulary while still sending sort=creation", async () => {
+    respondWith([1]);
+    const result = await runToolContract(stackexchangeSearchQuestions, {
+      query: 'q',
+      sort: 'newest',
+    });
+    expect(requestUrl().searchParams.get('sort')).toBe('creation');
+    const sc = structured(result);
+    expect(sc.appliedSort).toBe('newest');
+    expect(sc).not.toHaveProperty('sortOverrideReason');
+    const html = renderedContent(result);
+    expect(html).toContain('<strong>Sort:</strong> <code>newest</code>');
+    expect(html).not.toContain('creation');
+  });
+
+  it.each([
+    { name: 'a partial page', ids: [7, 5, 9], hasMore: false, input: {} },
+    { name: 'an empty page', ids: [], hasMore: false, input: {} },
+    { name: 'a truncated page', ids: [7, 5], hasMore: true, input: { pageSize: 2 } },
+    { name: 'a page past the end', ids: [], hasMore: false, input: { page: 12 } },
+  ])(
+    'reports relevance on the default call for $name, beside the existing notices',
+    async ({ ids, hasMore, input }) => {
+      respondWith(ids, hasMore);
+      const result = await runToolContract(stackexchangeSearchQuestions, { query: 'q', ...input });
+      const sc = structured(result);
+      expect(sc.appliedSort).toBe('relevance');
+      expect(sc).not.toHaveProperty('sortOverrideReason');
+      expect(sc.questions.map((q) => q.questionId)).toEqual(ids);
+      const html = renderedContent(result);
+      expect(html).toContain('<strong>Sort:</strong> <code>relevance</code>');
+      // The only block quote is the page's own notice, when it has one.
+      expect(blockquotes(html)).toEqual(sc.notice === undefined ? [] : [sc.notice]);
+    },
+  );
+
+  it('keeps the override reason and the truncation notice as separate block quotes', async () => {
+    respondWith([1, 2], true);
+    const result = await runToolContract(stackexchangeSearchQuestions, {
+      query: 'q',
+      sort: 'activity',
+      minScore: 5,
+      pageSize: 2,
+    });
+    const sc = structured(result);
+    expect(sc.truncated).toBe(true);
+    expect(blockquotes(renderedContent(result))).toEqual([overrideReason('activity'), sc.notice]);
   });
 });

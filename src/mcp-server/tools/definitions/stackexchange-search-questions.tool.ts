@@ -30,8 +30,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       .string()
       .default('stackoverflow')
       .describe(
-        'Stack Exchange site to search — use the api_site_parameter value (e.g. "stackoverflow", "superuser", "serverfault"). ' +
-          'Defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
+        'Stack Exchange site to search — the api_site_parameter (e.g. "stackoverflow", "superuser", "serverfault") or the site\'s domain (e.g. "serverfault.com"). Defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
       ),
     tags: z
       .array(z.string().describe('A single tag to filter by (e.g. "python", "async").'))
@@ -141,11 +140,22 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       .string()
       .optional()
       .describe('Actionable guidance when results are empty or filtered.'),
+    appliedSort: z
+      .enum(['relevance', 'votes', 'activity', 'newest'])
+      .describe('Sort Stack Exchange applied to these results.'),
+    sortOverrideReason: z
+      .string()
+      .optional()
+      .describe('Present only when appliedSort differs from the requested sort; says why.'),
   },
   enrichmentTrailer: {
     notice: { render: (value) => (value === undefined ? '' : `> ${escapeMarkdownInline(value)}`) },
     quotaRemaining: { label: 'Quota Remaining' },
     quotaMax: { label: 'Quota Max' },
+    appliedSort: { label: 'Sort' },
+    sortOverrideReason: {
+      render: (value) => (value === undefined ? '' : `> ${escapeMarkdownInline(value)}`),
+    },
   },
 
   errors: [
@@ -170,8 +180,25 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: 'The Stack Exchange API quota_remaining has reached 0.',
+      retryable: false,
       recovery:
         'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
+    },
+    {
+      reason: 'throttled',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      recovery:
+        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+    },
+    {
+      reason: 'pacer_shed',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
+      recovery:
+        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
     },
     {
       reason: 'paging_depth_limit',
@@ -193,7 +220,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       reason: 'upstream_unavailable',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      when: 'Stack Exchange reported itself temporarily unavailable or failing internally, or answered with a body that is not the expected JSON envelope.',
       recovery:
         'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
     },
@@ -202,7 +229,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
   async handler(input, ctx) {
     const svc = getStackExchangeService();
     const filteredTags = input.tags?.filter(Boolean);
-    const { questions, quotaRemaining, quotaMax, hasMore } = await svc.searchQuestions(
+    const { questions, quotaRemaining, quotaMax, hasMore, appliedSort } = await svc.searchQuestions(
       {
         query: input.query,
         site: input.site,
@@ -216,7 +243,18 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       ctx,
     );
 
-    ctx.enrich({ quotaRemaining, quotaMax });
+    // minScore is the only override: Stack Exchange's `min` bounds the active
+    // sort field, and votes is its only score sort.
+    ctx.enrich({
+      quotaRemaining,
+      quotaMax,
+      appliedSort,
+      ...(appliedSort !== input.sort
+        ? {
+            sortOverrideReason: `minScore filters on score, which Stack Exchange applies only under the votes sort, so results are ordered by votes instead of "${input.sort}".`,
+          }
+        : {}),
+    });
 
     // The two notices are mutually exclusive — a filled page cannot be an empty
     // one — and `truncated()` writes `notice` last-wins, so the branch is what

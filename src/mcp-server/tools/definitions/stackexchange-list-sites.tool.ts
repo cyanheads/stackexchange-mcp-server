@@ -73,8 +73,25 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: 'The Stack Exchange API quota_remaining reached 0 during the site page walk.',
+      retryable: false,
       recovery:
         'Quota resets at midnight UTC; set STACKEXCHANGE_API_KEY to lift the limit to 10,000 per day.',
+    },
+    {
+      reason: 'throttled',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      recovery:
+        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+    },
+    {
+      reason: 'pacer_shed',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
+      recovery:
+        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
     },
     {
       reason: 'invalid_parameter',
@@ -96,7 +113,7 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
       reason: 'upstream_unavailable',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Stack Exchange answered with a body that is not the expected JSON envelope.',
+      when: 'Stack Exchange reported itself temporarily unavailable or failing internally, or answered with a body that is not the expected JSON envelope.',
       recovery:
         'Retry in a few minutes — Stack Exchange is degraded and no change to the input helps.',
     },

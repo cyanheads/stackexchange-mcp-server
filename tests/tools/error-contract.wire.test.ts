@@ -28,6 +28,32 @@ import { stackexchangeListSites } from '@/mcp-server/tools/definitions/stackexch
 import { stackexchangeSearchQuestions } from '@/mcp-server/tools/definitions/stackexchange-search-questions.tool.js';
 import { initStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
 
+/**
+ * The service sleeps out an upstream backoff through `node:timers/promises`,
+ * which fake timers do not reach. Route it through the global clock so they do,
+ * rejecting on abort with the `AbortError` Node's own implementation raises.
+ */
+vi.mock('node:timers/promises', () => ({
+  setTimeout: (ms: number, value?: unknown, options?: { signal?: AbortSignal }) =>
+    new Promise((resolve, reject) => {
+      const signal = options?.signal;
+      const aborted = () => new DOMException('The operation was aborted', 'AbortError');
+      if (signal?.aborted) {
+        reject(aborted());
+        return;
+      }
+      const onAbort = () => {
+        globalThis.clearTimeout(timer);
+        reject(aborted());
+      };
+      const timer = globalThis.setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve(value);
+      }, ms);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    }),
+}));
+
 // ---------------------------------------------------------------------------
 // Contract lookup
 // ---------------------------------------------------------------------------
@@ -182,15 +208,13 @@ describe('service-thrown errors carry the calling tool contract recovery hint', 
   });
 
   it('quota_exceeded on stackexchange_get_tag_faq', async () => {
-    mockFetch(() => seOk({ items: [], quota_remaining: 0 }));
+    const fetchSpy = mockFetch(() => seOk({ items: [], quota_remaining: 0 }));
 
-    // RateLimited is a transient code, so withRetry sleeps 1s/2s/4s before
-    // giving up. Fake timers drive those sleeps rather than waiting them out.
-    vi.useFakeTimers();
-    const pending = runToolContract(stackexchangeGetTagFaq, { tag: 'python' });
-    for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(5_000);
-    const result = await pending;
+    // Not retried: the page Stack Exchange already served is the only request,
+    // so no timer needs driving.
+    const result = await runToolContract(stackexchangeGetTagFaq, { tag: 'python' });
 
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
     const error = wireError(result);
     expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
     expect(error.data?.reason).toBe('quota_exceeded');
@@ -814,6 +838,8 @@ describe('stackexchange_list_sites error contract', () => {
     // The walk never advanced past the page that reported the quota spent —
     // nine further requests against an exhausted quota is what the check buys.
     expect(fetchSpy.mock.calls.every((call) => pageOf(call[0]) === 1)).toBe(true);
+    // And never re-sent: a spent quota is not retried.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
   it('declares invalid_parameter for a rejected page-walk parameter', async () => {
@@ -850,6 +876,141 @@ describe('stackexchange_list_sites error contract', () => {
     // every calling tool declares — not one only stackexchange_list_sites has.
     expect(wireError(result).data?.reason).toBe('upstream_unavailable');
     expectRecoveryParity(result, stackexchangeSearchQuestions, 'upstream_unavailable');
+  });
+
+  it('declares upstream_unavailable for a 400-wrapped temporarily_unavailable envelope', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('unmocked fetch'))
+      .mockImplementation(async () =>
+        seEnvelope('temporarily_unavailable', 503, 'Some or all of the API is unavailable.'),
+      );
+
+    const result = await runTransient(() => runToolContract(stackexchangeListSites, {}));
+
+    const error = wireError(result);
+    // Pre-fix: -32602, a caller parameter error, after one request.
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.data?.reason).toBe('upstream_unavailable');
+    expectRecoveryParity(result, stackexchangeListSites, 'upstream_unavailable');
+    // Retried like a 5xx: the full ladder ran.
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #30 — throttling and queue sheds reach every tool's contract
+// ---------------------------------------------------------------------------
+
+/** SE's method-error envelope; every method error arrives on HTTP 400. */
+function seEnvelope(errorName: string, errorId: number, errorMessage: string): Response {
+  return new Response(
+    JSON.stringify({ error_id: errorId, error_message: errorMessage, error_name: errorName }),
+    { status: 400 },
+  );
+}
+
+/** SE's throttle once an IP's daily quota is spent — the wait runs to hours. */
+const throttleViolation = () =>
+  seEnvelope(
+    'throttle_violation',
+    502,
+    'too many requests from this IP, more requests available in 83980 seconds',
+  );
+
+/** A request that never answers until its signal aborts — holds the pacer's one slot. */
+const hangUntilAborted = async (_input: unknown, init?: RequestInit): Promise<Response> =>
+  new Promise((_resolve, reject) => {
+    const signal = init?.signal;
+    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+
+/** One minimal valid call per tool, each reaching Stack Exchange first thing. */
+const TOOL_CALLS: ReadonlyArray<readonly [string, Contracted, () => Promise<ToolResult>]> = [
+  [
+    'stackexchange_search_questions',
+    stackexchangeSearchQuestions,
+    () => runToolContract(stackexchangeSearchQuestions, { query: 'generics' }),
+  ],
+  [
+    'stackexchange_get_thread',
+    stackexchangeGetThread,
+    () => runToolContract(stackexchangeGetThread, { questionIdOrUrl: '11227809' }),
+  ],
+  [
+    'stackexchange_get_tag_faq',
+    stackexchangeGetTagFaq,
+    () => runToolContract(stackexchangeGetTagFaq, { tag: 'python' }),
+  ],
+  [
+    'stackexchange_get_user',
+    stackexchangeGetUser,
+    () => runToolContract(stackexchangeGetUser, { userId: 22656 }),
+  ],
+  [
+    'stackexchange_list_sites',
+    stackexchangeListSites,
+    () => runToolContract(stackexchangeListSites, {}),
+  ],
+];
+
+describe('throttling on the wire', () => {
+  it.each(TOOL_CALLS)('throttled on %s', async (_name, def, run) => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('unmocked fetch'))
+      .mockImplementationOnce(async () => throttleViolation());
+
+    const result = await run();
+
+    const error = wireError(result);
+    expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+    expect(error.data).toMatchObject({ reason: 'throttled', retryAfter: 83_980 });
+    expectRecoveryParity(result, def, 'throttled');
+    // The wait reaches format()-only clients too, not just the JSON surface.
+    expect(wireText(result)).toContain('83980 seconds');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends nothing on the call after a throttle names its wait', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('unmocked fetch'))
+      .mockImplementationOnce(async () => throttleViolation());
+
+    await runToolContract(stackexchangeListSites, {});
+    const result = await runToolContract(stackexchangeListSites, {});
+
+    const error = wireError(result);
+    expect(error.data?.reason).toBe('throttled');
+    expectRecoveryParity(result, stackexchangeListSites, 'throttled');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(TOOL_CALLS)('pacer_shed on %s', async (_name, def, run) => {
+    vi.useFakeTimers();
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('unmocked fetch'))
+      .mockImplementationOnce(async () => seOk({ items: [], backoff: 40 }))
+      .mockImplementationOnce(hangUntilAborted);
+
+    await runToolContract(stackexchangeListSites, {});
+    // Sleeps the 40s backoff in the pacer's slot, then hangs there past the
+    // queued call's wait budget.
+    const holder = runToolContract(stackexchangeListSites, {});
+    const pending = run();
+    await vi.advanceTimersByTimeAsync(50_001);
+    const [result] = await Promise.all([pending, holder]);
+
+    const error = wireError(result);
+    expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+    expect(error.data?.reason).toBe('pacer_shed');
+    expect(typeof error.data?.retryAfter).toBe('number');
+    expectRecoveryParity(result, def, 'pacer_shed');
+    expect(wireText(result)).toContain(`${error.data?.retryAfter} seconds`);
+    // The queued call never reached Stack Exchange.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -980,5 +1141,589 @@ describe('field-name rejections are untouched by the key classification', () => 
 
     expect(wireError(result).data?.reason).toBe('invalid_site');
     expectRecoveryParity(result, stackexchangeSearchQuestions, 'invalid_site');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #34 — a question URL carries its own site
+// ---------------------------------------------------------------------------
+
+/** One request the service sent upstream, decoded for assertions. */
+interface SentRequest {
+  params: Record<string, string>;
+  path: string;
+  site: string | null;
+}
+
+const HEREDOC_TITLE =
+  'How do you use output redirection in combination with here-documents and cat?';
+const ASP_NET_TITLE = 'Throwing exceptions in ASP.NET C#';
+
+/**
+ * Route the getThread call graph and record every request. The question is
+ * served from whichever ID the path names, and its title depends on the site
+ * the request named, so a thread fetched from the wrong site is visible on
+ * both surfaces — Stack Overflow's 88490 is an unrelated ASP.NET question.
+ * The question `link` is on the site's canonical host, as Stack Exchange
+ * returns it whatever alias was sent (`arqade.com` comes back on
+ * `gaming.stackexchange.com`); `linkHost` sets it where the sent site is an
+ * alias. A site in `unknownSites` draws SE's live "No site found" rejection;
+ * `transient` answers the first `times` requests naming its site with SE's
+ * 503 envelope, which the service retries like a 5xx. Anything not addressed
+ * to the Stack Exchange API is refused, so a test can never reach the network.
+ */
+const recordThreadFetch = (
+  opts: {
+    acceptedAnswerId?: number;
+    questionItems?: boolean;
+    linkHost?: string;
+    unknownSites?: string[];
+    transient?: { site: string; times: number };
+  } = {},
+) => {
+  const sent: SentRequest[] = [];
+  let transientLeft = opts.transient?.times ?? 0;
+  const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = new URL(String(input));
+    if (url.origin !== 'https://api.stackexchange.com') {
+      throw new Error(`Unmocked fetch: ${url.origin}`);
+    }
+    const params = Object.fromEntries([...url.searchParams].filter(([k]) => k !== 'key')) as Record<
+      string,
+      string
+    >;
+    const path = url.pathname.replace(/^\/2\.3/, '');
+    const sentSite = url.searchParams.get('site');
+    sent.push({ path, site: sentSite, params });
+
+    if (sentSite && opts.unknownSites?.includes(sentSite)) {
+      return seBadParameter(`No site found for name \`${sentSite}\``);
+    }
+    if (sentSite === opts.transient?.site && transientLeft > 0) {
+      transientLeft--;
+      return seEnvelope('temporarily_unavailable', 503, 'Some or all of the API is unavailable.');
+    }
+    if (path.endsWith('/comments')) return seOk({ items: [] });
+    if (path.startsWith('/answers/')) {
+      return seOk({
+        items: [{ answer_id: 5, question_id: 1, score: 1, is_accepted: true, body: '<p>A.</p>' }],
+      });
+    }
+    if (path.endsWith('/answers')) {
+      return seOk({
+        items: [{ answer_id: 7, question_id: 1, score: 3, is_accepted: false, body: '<p>B.</p>' }],
+      });
+    }
+    const id = Number(path.split('/')[2]);
+    if (opts.questionItems === false) return seOk({ items: [] });
+    const site = url.searchParams.get('site') ?? '';
+    const linkHost =
+      opts.linkHost ??
+      (site.includes('.')
+        ? site.replace(/^www\./, '')
+        : site === 'stackoverflow'
+          ? 'stackoverflow.com'
+          : `${site}.stackexchange.com`);
+    return seOk({
+      items: [
+        {
+          question_id: id,
+          title: site === 'stackoverflow' ? ASP_NET_TITLE : HEREDOC_TITLE,
+          link: `https://${linkHost}/questions/${id}`,
+          score: 1,
+          answer_count: 1,
+          is_answered: true,
+          tags: ['bash'],
+          body: '<p>Body.</p>',
+          ...(opts.acceptedAnswerId ? { accepted_answer_id: opts.acceptedAnswerId } : {}),
+        },
+      ],
+    });
+  });
+  return { spy, sent };
+};
+
+/**
+ * Refuse every upstream call — for inputs that must be rejected before any
+ * request. Answered with a non-retryable rejection rather than a thrown network
+ * error, which the service would retry until the test timed out.
+ */
+const refuseFetch = () => mockFetch(() => seBadParameter('unexpected request'));
+
+/** Every text block of `content[]` — the enrichment trailer is a block of its own. */
+const allText = (result: ToolResult): string =>
+  result.content.map((block) => (block as { text?: string }).text ?? '').join('\n');
+
+describe('get_thread site resolution — unchanged shapes (characterization)', () => {
+  it('sends the default site, unchanged, for a bare numeric ID', async () => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl: '11227809' });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.map((r) => [r.path, r.params])).toEqual([
+      ['/questions/11227809', { site: 'stackoverflow', filter: 'withbody' }],
+      [
+        '/questions/11227809/answers',
+        { site: 'stackoverflow', filter: 'withbody', sort: 'votes', pagesize: '10' },
+      ],
+    ]);
+  });
+
+  it.each([
+    ['superuser', 'superuser'],
+    ['unix', 'unix'],
+    ['unix.stackexchange.com', 'unix.stackexchange.com'],
+  ])('sends an explicit site %s verbatim for a bare numeric ID', async (site, sentSite) => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: '88490',
+      site,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.length).toBe(2);
+    expect(sent.every((r) => r.site === sentSite)).toBe(true);
+  });
+
+  it.each([
+    ['https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster', {}],
+    ['https://stackoverflow.com/questions/11227809', { site: 'stackoverflow' }],
+    ['stackoverflow.com/questions/11227809/why', {}],
+  ])('reads question 11227809 from the Stack Overflow URL %s', async (questionIdOrUrl, extra) => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl, ...extra });
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { questionId: number }).questionId).toBe(11227809);
+    expect(sent.map((r) => [r.path, r.site])).toEqual([
+      ['/questions/11227809', 'stackoverflow.com'],
+      ['/questions/11227809/answers', 'stackoverflow.com'],
+    ]);
+  });
+
+  it('returns the URL’s own question when the matching api_site_parameter is passed', async () => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: 'https://unix.stackexchange.com/questions/88490/how-do-i-use-a-heredoc',
+      site: 'unix',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { title: string }).title).toBe(HEREDOC_TITLE);
+    expect(wireText(result)).toContain('here-documents');
+    expect(sent[0]?.path).toBe('/questions/88490');
+  });
+
+  it.each([
+    'https://stackoverflow.com/users/22656/jon-skeet',
+    'https://stackoverflow.com/questions/tagged/python',
+  ])('rejects %s as invalid_id_or_url before any request', async (questionIdOrUrl) => {
+    const fetchSpy = refuseFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl });
+
+    expect(wireError(result).data?.reason).toBe('invalid_id_or_url');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Inputs 0.1.17 answered with the right thread: it took the number after the
+ * first `/questions/` anywhere in the text and read it from `site`, so any of
+ * these returned the intended question when `site` named its site.
+ */
+describe('get_thread site resolution — shapes 0.1.17 answered correctly (characterization)', () => {
+  it.each([
+    [
+      'https://arqade.com/questions/417783/auto-bridge',
+      'gaming',
+      'gaming.stackexchange.com',
+      417783,
+      'arqade.com',
+    ],
+    [
+      'https://programmers.stackexchange.com/questions/225924/fail-fast',
+      'softwareengineering',
+      'softwareengineering.stackexchange.com',
+      225924,
+      'programmers.stackexchange.com',
+    ],
+    ['/questions/88490/how-do-i-use-a-heredoc', 'unix', undefined, 88490, 'unix'],
+    [
+      '<https://unix.stackexchange.com/questions/88490>',
+      'unix',
+      undefined,
+      88490,
+      'unix.stackexchange.com',
+    ],
+    [
+      'https://web.archive.org/web/2015/https://unix.stackexchange.com/questions/88490/x',
+      'unix',
+      undefined,
+      88490,
+      'unix.stackexchange.com',
+    ],
+    [
+      'ftp://stackoverflow.com/questions/11227809',
+      'stackoverflow',
+      undefined,
+      11227809,
+      'stackoverflow.com',
+    ],
+  ])(
+    'still reads %s with site %j',
+    async (questionIdOrUrl, site, linkHost, questionId, sentSite) => {
+      const { sent } = recordThreadFetch(linkHost ? { linkHost } : {});
+
+      const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl, site });
+
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as { questionId: number }).questionId).toBe(questionId);
+      expect(sent.map((r) => [r.path, r.site])).toEqual([
+        [`/questions/${questionId}`, sentSite],
+        [`/questions/${questionId}/answers`, sentSite],
+      ]);
+    },
+  );
+
+  it('still reads a translation-proxy URL from the explicit site, and says why', async () => {
+    const proxy = 'stackoverflow-com.translate.goog';
+    const { sent } = recordThreadFetch({ unknownSites: [proxy] });
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: `https://${proxy}/questions/88490/x?_x_tr_sl=en&_x_tr_tl=de`,
+      site: 'stackoverflow',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { questionId: number }).questionId).toBe(88490);
+    // The host is tried once, then the 0.1.17 request — question and answers
+    // from the supplied site.
+    expect(sent.map((r) => [r.path, r.site])).toEqual([
+      ['/questions/88490', proxy],
+      ['/questions/88490', 'stackoverflow'],
+      ['/questions/88490/answers', 'stackoverflow'],
+    ]);
+    expect((result.structuredContent as { siteConflict?: unknown }).siteConflict).toEqual({
+      resolvedBy: 'site',
+      urlHost: proxy,
+      site: 'stackoverflow',
+    });
+    expect(allText(result)).toContain(
+      `${proxy} is not a Stack Exchange site, so the question was read from site "stackoverflow"`,
+    );
+  });
+
+  it('sends a refused URL host once — retries after a transient failure go to the explicit site alone', async () => {
+    const proxy = 'unix-stackexchange-com.translate.goog';
+    const { sent } = recordThreadFetch({
+      unknownSites: [proxy],
+      transient: { site: 'unix', times: 2 },
+    });
+
+    const result = await runTransient(() =>
+      runToolContract(stackexchangeGetThread, {
+        questionIdOrUrl: `https://${proxy}/questions/88490/x`,
+        site: 'unix',
+      }),
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { title: string }).title).toBe(HEREDOC_TITLE);
+    // Attempts 2 and 3 skip the host Stack Exchange already refused.
+    expect(sent.map((r) => [r.path, r.site])).toEqual([
+      ['/questions/88490', proxy],
+      ['/questions/88490', 'unix'],
+      ['/questions/88490', 'unix'],
+      ['/questions/88490', 'unix'],
+      ['/questions/88490/answers', 'unix'],
+    ]);
+    expect((result.structuredContent as { siteConflict?: unknown }).siteConflict).toEqual({
+      resolvedBy: 'site',
+      urlHost: proxy,
+      site: 'unix',
+    });
+  });
+
+  it('keeps invalid_site for a translation-proxy URL sent without site, after one request', async () => {
+    const proxy = 'stackoverflow-com.translate.goog';
+    const { spy, sent } = recordThreadFetch({ unknownSites: [proxy] });
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: `https://${proxy}/questions/88490`,
+    });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(sent[0]?.site).toBe(proxy);
+    expect(wireError(result).data?.reason).toBe('invalid_site');
+    expectRecoveryParity(result, stackexchangeGetThread, 'invalid_site');
+  });
+
+  it('reports the fallback site, not the URL host, when the supplied site is unknown too', async () => {
+    const { spy } = recordThreadFetch({ unknownSites: ['example.com', 'notasite'] });
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: 'https://example.com/questions/1',
+      site: 'notasite',
+    });
+
+    expect(spy).toHaveBeenCalledTimes(2);
+    const error = wireError(result);
+    expect(error.data?.reason).toBe('invalid_site');
+    expect(error.message).toContain('notasite');
+  });
+});
+
+describe('get_thread site resolution — a URL carries its site', () => {
+  it('reads the issue’s Unix & Linux URL from Unix & Linux, not Stack Overflow', async () => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: 'https://unix.stackexchange.com/questions/88490/how-do-i-use-a-heredoc',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.map((r) => r.site)).toEqual(['unix.stackexchange.com', 'unix.stackexchange.com']);
+    expect((result.structuredContent as { title: string }).title).toBe(HEREDOC_TITLE);
+    expect(wireText(result)).toContain('here-documents');
+    expect(wireText(result)).not.toContain('ASP.NET');
+  });
+
+  it.each([
+    [
+      'https://stackoverflow.com/questions/11227809/why-is-processing',
+      11227809,
+      'stackoverflow.com',
+    ],
+    ['https://superuser.com/questions/1941255/no-access', 1941255, 'superuser.com'],
+    ['https://askubuntu.com/questions/1570647', 1570647, 'askubuntu.com'],
+    ['https://ru.stackoverflow.com/questions/1627572/c', 1627572, 'ru.stackoverflow.com'],
+    ['https://meta.stackexchange.com/questions/420225', 420225, 'meta.stackexchange.com'],
+    ['https://unix.stackexchange.com/questions/88490', 88490, 'unix.stackexchange.com'],
+    ['https://unix.meta.stackexchange.com/questions/9311', 9311, 'unix.meta.stackexchange.com'],
+    ['https://meta.unix.stackexchange.com/questions/9311', 9311, 'meta.unix.stackexchange.com'],
+    ['https://stackapps.com/questions/12113/placeholder', 12113, 'stackapps.com'],
+    ['https://mathoverflow.net/questions/7155', 7155, 'mathoverflow.net'],
+    ['https://www.stackoverflow.com/questions/11227809', 11227809, 'stackoverflow.com'],
+    ['http://Unix.StackExchange.com/questions/88490', 88490, 'unix.stackexchange.com'],
+    ['unix.stackexchange.com/questions/88490/how', 88490, 'unix.stackexchange.com'],
+    ['https://stackoverflow.com./questions/11227809', 11227809, 'stackoverflow.com'],
+    [
+      '  https://unix.stackexchange.com/questions/88490/x?noredirect=1#comment1  ',
+      88490,
+      'unix.stackexchange.com',
+    ],
+  ])('sends the host of %s as site', async (questionIdOrUrl, questionId, site) => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.map((r) => [r.path, r.site])).toEqual([
+      [`/questions/${questionId}`, site],
+      [`/questions/${questionId}/answers`, site],
+    ]);
+  });
+
+  it('reads a fully qualified host (trailing dot) as its site, never as one off the network', async () => {
+    // Live, Stack Exchange answers the dotted form with "No site found".
+    const { sent } = recordThreadFetch({ unknownSites: ['stackoverflow.com.'] });
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: 'https://stackoverflow.com./questions/11227809/why',
+      site: 'stackoverflow',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.map((r) => [r.path, r.site])).toEqual([
+      ['/questions/11227809', 'stackoverflow.com'],
+      ['/questions/11227809/answers', 'stackoverflow.com'],
+    ]);
+    expect((result.structuredContent as { siteConflict?: unknown }).siteConflict).toBeUndefined();
+    expect(allText(result)).not.toContain('is not a Stack Exchange site');
+  });
+
+  it('carries the URL’s site onto the accepted-answer and comment routes', async () => {
+    const { sent } = recordThreadFetch({ acceptedAnswerId: 5 });
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: 'https://unix.stackexchange.com/questions/88490',
+      includeComments: true,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.map((r) => r.path)).toEqual([
+      '/questions/88490',
+      '/questions/88490/answers',
+      '/answers/5',
+      '/questions/88490/comments',
+      '/answers/5;7/comments',
+    ]);
+    expect(sent.every((r) => r.site === 'unix.stackexchange.com')).toBe(true);
+  });
+
+  it('reports a missing question against the URL’s site', async () => {
+    recordThreadFetch({ questionItems: false });
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: 'https://unix.stackexchange.com/questions/88490',
+    });
+
+    const error = wireError(result);
+    expect(error.data?.reason).toBe('question_not_found');
+    expect(error.message).toContain('unix.stackexchange.com');
+  });
+
+  it.each([
+    ['https://unix.stackexchange.com/questions/88490', 'unix', undefined],
+    ['https://unix.stackexchange.com/questions/88490', 'unix.stackexchange.com', undefined],
+    ['https://unix.stackexchange.com/questions/88490', ' Unix ', undefined],
+    ['https://stackoverflow.com/questions/11227809', 'stackoverflow', undefined],
+    ['https://stackoverflow.com/questions/11227809', 'stackoverflow.com', undefined],
+    ['https://stackoverflow.com/questions/11227809', 'www.stackoverflow.com', undefined],
+    ['https://ru.stackoverflow.com/questions/1627572', 'ru.stackoverflow', undefined],
+    ['https://meta.stackexchange.com/questions/420225', 'meta', undefined],
+    ['https://unix.meta.stackexchange.com/questions/9311', 'unix.meta', undefined],
+    [
+      'https://meta.unix.stackexchange.com/questions/9311',
+      'unix.meta',
+      'unix.meta.stackexchange.com',
+    ],
+    ['https://askubuntu.com/questions/1570647', 'askubuntu', undefined],
+    ['https://mathoverflow.net/questions/7155', 'mathoverflow.net', undefined],
+    ['https://arqade.com/questions/417783', 'gaming', 'gaming.stackexchange.com'],
+    ['https://arqade.com/questions/417783', 'arqade.com', 'gaming.stackexchange.com'],
+    [
+      'https://programmers.stackexchange.com/questions/225924',
+      'softwareengineering',
+      'softwareengineering.stackexchange.com',
+    ],
+  ])(
+    'reads %s from its host and reports nothing for the matching site %j',
+    async (questionIdOrUrl, site, linkHost) => {
+      const { sent } = recordThreadFetch(linkHost ? { linkHost } : {});
+
+      const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl, site });
+
+      expect(result.isError).toBeFalsy();
+      const host = new URL(questionIdOrUrl).hostname.replace(/^www\./, '');
+      expect(sent.length).toBe(2);
+      expect(sent.every((r) => r.site === host)).toBe(true);
+      expect((result.structuredContent as { siteConflict?: unknown }).siteConflict).toBeUndefined();
+      expect(allText(result)).not.toContain('was ignored');
+    },
+  );
+
+  it.each([
+    '/questions/88490/how-do-i-use-a-heredoc',
+    // No scheme in front of the inner host, so nothing marks where it starts.
+    'https://web.archive.org/web/2020/unix.stackexchange.com/questions/88490/x',
+  ])('reads the hostless /questions/ path %s from site', async (questionIdOrUrl) => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl,
+      site: 'unix',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.map((r) => r.site)).toEqual(['unix', 'unix']);
+    expect((result.structuredContent as { siteConflict?: unknown }).siteConflict).toBeUndefined();
+  });
+
+  it.each([
+    ['<https://unix.stackexchange.com/questions/88490>', 'unix.stackexchange.com'],
+    [
+      'https://web.archive.org/web/2015/https://unix.stackexchange.com/questions/88490/x',
+      'unix.stackexchange.com',
+    ],
+    ['ftp://stackoverflow.com/questions/11227809', 'stackoverflow.com'],
+    ['https://user@unix.stackexchange.com:443/questions/88490', 'unix.stackexchange.com'],
+    ['<unix.stackexchange.com/questions/88490>', 'unix.stackexchange.com'],
+    ['see unix.stackexchange.com/questions/88490', 'unix.stackexchange.com'],
+    ['[heredoc](unix.stackexchange.com/questions/88490)', 'unix.stackexchange.com'],
+  ])('takes the host in front of /questions/ in %s', async (questionIdOrUrl, host) => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.map((r) => r.site)).toEqual([host, host]);
+  });
+});
+
+describe('get_thread site resolution — a site the URL contradicts', () => {
+  it.each([
+    ['https://unix.stackexchange.com/questions/88490', 'superuser', 'unix.stackexchange.com'],
+    ['https://unix.stackexchange.com/questions/88490', 'stackoverflow', 'unix.stackexchange.com'],
+    ['https://ru.stackoverflow.com/questions/1627572', 'stackoverflow', 'ru.stackoverflow.com'],
+    ['https://stackoverflow.com/questions/11227809', 'meta.stackoverflow', 'stackoverflow.com'],
+    ['https://unix.meta.stackexchange.com/questions/9311', 'unix', 'unix.meta.stackexchange.com'],
+    ['https://stackoverflow.com/questions/11227809', 'superuser.com', 'stackoverflow.com'],
+  ])(
+    'reads %s from its host, ignores site %j, and says so on both surfaces',
+    async (questionIdOrUrl, site, host) => {
+      const { sent } = recordThreadFetch();
+
+      const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl, site });
+
+      expect(result.isError).toBeFalsy();
+      expect(sent.length).toBe(2);
+      expect(sent.every((r) => r.site === host)).toBe(true);
+      expect((result.structuredContent as { siteConflict?: unknown }).siteConflict).toEqual({
+        resolvedBy: 'url_host',
+        urlHost: host,
+        site,
+      });
+      expect(allText(result)).toContain(
+        `site "${site}" was ignored — the question was read from ${host}`,
+      );
+    },
+  );
+
+  it('advertises no site_mismatch reason — a contradicting site is never an error', () => {
+    expect(declaredReasons(stackexchangeGetThread)).not.toContain('site_mismatch');
+  });
+});
+
+describe('get_thread site resolution — a host off the network', () => {
+  it.each([
+    ['https://github.com/questions/123/how', 'github.com'],
+    ['https://stackexchange.com/questions/123', 'stackexchange.com'],
+    ['https://stackoverflow.com.evil.example/questions/123', 'stackoverflow.com.evil.example'],
+    ['https://notstackoverflow.com/questions/123', 'notstackoverflow.com'],
+    ['https://example.com/questions/123', 'example.com'],
+  ])(
+    'sends %s upstream and surfaces the unknown-site rejection as invalid_site',
+    async (questionIdOrUrl, host) => {
+      // The live wording for an unknown host, verified for example.com.
+      const fetchSpy = mockFetch(() => seBadParameter(`No site found for name \`${host}\``));
+
+      const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(new URL(String(fetchSpy.mock.calls[0]?.[0])).searchParams.get('site')).toBe(host);
+      const error = wireError(result);
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.data?.reason).toBe('invalid_site');
+      expect(error.message).toContain(host);
+      expectRecoveryParity(result, stackexchangeGetThread, 'invalid_site');
+    },
+  );
+
+  it('rejects text with no /questions/{id} as invalid_id_or_url before any request', async () => {
+    const fetchSpy = refuseFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: 'https://unix.stackexchange.com/users/1/someone',
+    });
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(wireError(result).data?.reason).toBe('invalid_id_or_url');
+    expectRecoveryParity(result, stackexchangeGetThread, 'invalid_id_or_url');
   });
 });
