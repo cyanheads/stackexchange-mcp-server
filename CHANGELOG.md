@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-10-28 · ⚠️ Breaking
+
+Publishes the stackexchange-guide agent skill, classifies Stack Exchange throttles and 400-wrapped outages with a retryAfter, reports the applied sort on search, and reads a question URL from its own site. Breaking: get_thread with a translate-proxy URL and no site now fails invalid_site.
+
 ## [0.1.17](changelog/0.1.x/0.1.17.md) — 2026-10-25
 
 Plain-text titles, names, links, and empty-result notices retain their literal text in Markdown output; adopts mcp-ts-core 0.13.16 and refreshes dependencies and packaging.

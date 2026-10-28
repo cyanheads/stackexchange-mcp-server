@@ -1,6 +1,6 @@
 # stackexchange-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 09:51:14
+Generated on: 2026-10-28 14:53:08
 
 ```text
 stackexchange-mcp-server/
@@ -25,6 +25,7 @@ stackexchange-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -37,6 +38,8 @@ stackexchange-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -134,6 +137,9 @@ stackexchange-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── stackexchange-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -164,15 +170,16 @@ stackexchange-mcp-server/
 │   │       ├── html-normalizer.test.ts
 │   │       ├── pacing.test.ts
 │   │       └── stackexchange-service.test.ts
-│   └── tools/
-│       ├── error-contract.wire.test.ts
-│       ├── inline-markdown.contract.test.ts
-│       ├── stackexchange-get-tag-faq.tool.test.ts
-│       ├── stackexchange-get-thread.tool.test.ts
-│       ├── stackexchange-get-user.tool.test.ts
-│       ├── stackexchange-list-sites.tool.test.ts
-│       ├── stackexchange-search-questions.tool.test.ts
-│       └── table-markdown.contract.test.ts
+│   ├── tools/
+│   │   ├── error-contract.wire.test.ts
+│   │   ├── inline-markdown.contract.test.ts
+│   │   ├── stackexchange-get-tag-faq.tool.test.ts
+│   │   ├── stackexchange-get-thread.tool.test.ts
+│   │   ├── stackexchange-get-user.tool.test.ts
+│   │   ├── stackexchange-list-sites.tool.test.ts
+│   │   ├── stackexchange-search-questions.tool.test.ts
+│   │   └── table-markdown.contract.test.ts
+│   └── index.skills.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
@@ -188,7 +195,9 @@ stackexchange-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
