@@ -19,6 +19,7 @@ await createApp({
   tools: allToolDefinitions,
   resources: [],
   prompts: [],
+  skills: 'skills',
   instructions:
     'Use stackexchange_list_sites to find a community, then stackexchange_search_questions or stackexchange_get_tag_faq to discover question IDs. Read full Q&A content with stackexchange_get_thread, and pass an authorUserId to stackexchange_get_user for author context.',
   setup(core) {
