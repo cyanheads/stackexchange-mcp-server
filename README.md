@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.17-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/stackexchange-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/stackexchange-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/stackexchange-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.17-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/stackexchange-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/stackexchange-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/stackexchange-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -37,9 +37,13 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 |:---|:---|
 | `stackexchange_search_questions` | Search questions across a Stack Exchange site with full-text query, tag filters, score threshold, and sort order |
 | `stackexchange_get_thread` | Fetch a question and its answers as markdown, with a configurable answer limit and the accepted answer first |
-| `stackexchange_get_tag_faq` | Fetch the highest-voted answered questions for a tag — the canonical "best answers in X" list |
+| `stackexchange_get_tag_faq` | Fetch a tag's frequently asked questions — Stack Exchange's own selection, in its order rather than by score |
 | `stackexchange_get_user` | Fetch a user profile by ID: reputation, badge counts, top tags by answer score, and account metadata |
 | `stackexchange_list_sites` | Enumerate all Stack Exchange network sites and their `api_site_parameter` values |
+
+### Agent skill
+
+[`skills/stackexchange-guide`](./skills/stackexchange-guide/SKILL.md) covers what the tool schemas don't: why IDs never carry across sites and which site a URL or ID is read from, search syntax for error messages and tags, choosing which answer to quote, and what each call costs against the daily quota. Plugin installs (Claude Code, Codex) and the Claude Desktop bundle load it from the package, and MCP clients that support the Skills extension read it from the server through `skills/list`.
 
 ---
 
@@ -51,12 +55,14 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 - Up to 30 results per page (default 10); `page` for more — each page costs one API quota unit, and paging past 25 requires `STACKEXCHANGE_API_KEY`
 - Returns question ID, title, score, answer count, tags, and a ~300-character excerpt — IDs flow directly into `stackexchange_get_thread`
 - Quota remaining and max surfaced via enrichment on every response
+- Every response reports `appliedSort`, the order Stack Exchange actually used; `minScore` forces `votes`, and `sortOverrideReason` says so whenever that replaces the requested `sort`
 
 ---
 
 ### `stackexchange_get_thread` <sub>tool</sub>
 
 - Accepts a numeric question ID or a full Stack Exchange question URL; fetches the question and a page of `maxAnswers` answers (1–100, default 10), adding the accepted answer if it falls outside that page
+- A URL is read from the site its host names (`unix.stackexchange.com`, `ru.stackoverflow.com`, `arqade.com`, …), so `site` applies only to a numeric ID or a hostless `/questions/` path; a `site` naming a different site than the URL is ignored, and a URL whose host is not a Stack Exchange site (a translation proxy) is read from `site` instead — either way reported as `siteConflict` on both surfaces. Such a URL sent without `site` fails as `invalid_site`
 - HTML→markdown normalization built in — code blocks, links, lists, headers, and blockquotes all converted
 - Optional `includeComments` fetches up to 20 comments per post, newest first, using two extra API calls (one when there are no answers); `commentsTruncated` reports partial lists
 - Attribution (author name, profile link, score) on every answer per CC BY-SA 4.0
@@ -66,7 +72,7 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 
 ### `stackexchange_get_tag_faq` <sub>tool</sub>
 
-- Highest-voted answered questions for a tag — maps to `/tags/{tag}/faq`, the canonical "best answers in X" list
+- A tag's frequently asked questions — maps to `/tags/{tag}/faq`, Stack Exchange's own selection, returned in its order and not sorted by score
 - Up to 30 results per page (default 10); `page` for more — each page costs one API quota unit, and paging past 25 requires `STACKEXCHANGE_API_KEY`
 - Returns a question list without bodies; pipe any `questionId` into `stackexchange_get_thread` for full content
 - Quota remaining and max surfaced via enrichment on every response
@@ -86,7 +92,7 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 
 - Fetches every site in the Stack Exchange network, walking pages of 100 up to a 10-page cap; an enrichment notice flags a partial list if the network still has more
 - Optional case-insensitive name filter matches against site name and `api_site_parameter`, applied client-side after the fetch
-- Returns the `api_site_parameter` value (e.g. `stackoverflow`, `superuser`, `serverfault`) that every other tool's `site` parameter accepts
+- Returns the `api_site_parameter` value (e.g. `stackoverflow`, `superuser`, `serverfault`) that every other tool's `site` parameter accepts; the site's domain (e.g. `serverfault.com`) works there too
 
 ---
 
@@ -97,9 +103,9 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Stack Exchange-specific:
 
 - HTML→markdown conversion preserves code blocks, tables, links, images, and nested lists
-- Shared upstream queue honors response backoff and HTTP 429 cooldowns; each operation has a 50-second budget covering queue time, backoff, requests, and retries
+- Shared upstream queue honors response backoff, stated throttle waits, and HTTP 429 cooldowns; each operation has a 50-second budget covering queue time, backoff, requests, and retries, a backoff that cannot fit it fails at once, and a queued call sheds before the budget ends, both with `retryAfter` instead of running out the clock
 - Quota logging: `quota_remaining` and `quota_max` surfaced via enrichment on every tool call
-- Typed error contracts on every tool — `invalid_site`, `invalid_parameter`, `invalid_api_key`, `invalid_id_or_url`, `invalid_user_id`, `question_not_found`, `user_not_found`, `paging_depth_limit`, `quota_exceeded`, and `upstream_unavailable`
+- Typed error contracts on every tool — `invalid_site`, `invalid_parameter`, `invalid_api_key`, `invalid_id_or_url`, `invalid_user_id`, `question_not_found`, `user_not_found`, `paging_depth_limit`, `quota_exceeded`, `throttled`, `pacer_shed`, and `upstream_unavailable`
 - Optional `STACKEXCHANGE_API_KEY` lifts the per-IP quota from ~300/day to ~10,000/day with no OAuth required
 
 Agent-friendly output:
@@ -113,139 +119,32 @@ Agent-friendly output:
 
 ## Getting started
 
-### Public Hosted Instance
-
-A public instance is available at `https://stackexchange.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own config shape.
-
-For Claude Code:
+Connect to the hosted instance, no install:
 
 ```sh
 claude mcp add --transport http stackexchange-mcp-server https://stackexchange.caseyjhand.com/mcp
 ```
 
-For Cline (`cline_mcp_settings.json`):
+Or run it locally:
+
+```sh
+claude mcp add stackexchange-mcp-server -- npx -y @cyanheads/stackexchange-mcp-server
+```
+
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "stackexchange-mcp-server": {
-      "type": "streamableHttp",
-      "url": "https://stackexchange.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-For Cursor (`mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "stackexchange-mcp-server": {
-      "url": "https://stackexchange.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-Claude Desktop adds remote servers under Settings → Connectors.
-
-### Self-Hosted / Local
-
-Add the following to your MCP client configuration file.
-
-```json
-{
-  "mcpServers": {
-    "stackexchange": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/stackexchange-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
-```
-
-Or with npx (no Bun required):
-
-```json
-{
-  "mcpServers": {
-    "stackexchange": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/stackexchange-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
+      "args": ["-y", "@cyanheads/stackexchange-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "stackexchange": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "ghcr.io/cyanheads/stackexchange-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-**Rate limits:** The Stack Exchange API allows ~300 requests/day per IP without a key. Set `STACKEXCHANGE_API_KEY` in `env` to lift this to ~10,000/day. Register a key at [stackapps.com/apps/oauth/register](https://stackapps.com/apps/oauth/register) (the OAuth flow is only required for write access — a key alone is sufficient for read-only use).
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+)
-- A `STACKEXCHANGE_API_KEY` is optional but strongly recommended for any sustained use
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/stackexchange-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd stackexchange-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# edit .env and set STACKEXCHANGE_API_KEY if desired
-```
+Without a key, the Stack Exchange API allows ~300 requests/day per IP; set `STACKEXCHANGE_API_KEY` to lift this to ~10,000/day. Register a key at [stackapps.com/apps/oauth/register](https://stackapps.com/apps/oauth/register) — a key alone covers read-only use. For Docker or a source build, see [Running the server](#running-the-server).
 
 ---
 
@@ -274,6 +173,16 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+
+- **Clone and install:**
+
+  ```sh
+  git clone https://github.com/cyanheads/stackexchange-mcp-server.git
+  cd stackexchange-mcp-server && bun install
+  cp .env.example .env   # optionally set STACKEXCHANGE_API_KEY
+  ```
+
 - **Build and run:**
 
   ```sh
@@ -297,11 +206,10 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 ### Docker
 
 ```sh
-docker build -t stackexchange-mcp-server .
-docker run --rm -e STACKEXCHANGE_API_KEY=your-key -p 3010:3010 stackexchange-mcp-server
+docker run --rm -e STACKEXCHANGE_API_KEY=your-key -p 3010:3010 ghcr.io/cyanheads/stackexchange-mcp-server:latest
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/stackexchange-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The image defaults to HTTP transport, stateless session mode, and logs to `/var/log/stackexchange-mcp-server`. To run it over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/stackexchange-mcp-server:latest"]`. To build locally, `docker build -t stackexchange-mcp-server .`; OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ---
 
@@ -313,6 +221,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config/` | Server-specific environment variable parsing with Zod (`STACKEXCHANGE_API_KEY`). |
 | `src/mcp-server/tools/` | Tool definitions (`*.tool.ts`). |
 | `src/services/stackexchange/` | Stack Exchange API v2.3 HTTP client, backoff tracking, quota logging, HTML→markdown normalizer. |
+| `skills/` | The `stackexchange-guide` agent skill, published to installing and connecting clients. |
 | `tests/` | Vitest unit and integration tests. |
 | `docs/` | Design document and directory tree. |
 
