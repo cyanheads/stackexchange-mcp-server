@@ -16,13 +16,13 @@ const QUESTION_REF = /\/questions\/(\d+)/;
 
 /**
  * The authority directly in front of that reference — after `//`, or, when no
- * scheme was written, after the start of the text, whitespace, `<`, `(` or `[`.
- * Anchored at the end, so wrapped forms (`<https://…>`, an archive URL around a
- * question URL, `see unix.stackexchange.com/questions/…`) yield the host the
- * question path belongs to. The capture excludes every delimiter, so each
- * candidate start scans only to the next one: linear in the input.
+ * scheme was written, after the start of the text, whitespace, `<`, `(`, `[` or
+ * a quote. Anchored at the end, so wrapped forms (`<https://…>`, an archive URL
+ * around a question URL, `see unix.stackexchange.com/questions/…`) yield the
+ * host the question path belongs to. The capture excludes every delimiter, so
+ * each candidate start scans only to the next one: linear in the input.
  */
-const AUTHORITY_BEFORE = /(?:^|\/\/|[\s<([])([^\s/?#<>()[\]]+)$/;
+const AUTHORITY_BEFORE = /(?:^|\/\/|[\s<(["'`])([^\s/?#<>()[\]"'`]+)$/;
 
 /**
  * A hostname lowercased, without a leading `www.` or the trailing dot of a
@@ -42,8 +42,8 @@ const bareHost = (hostname: string): string =>
  * aliases included (`arqade.com`, `programmers.stackexchange.com`), and
  * rejects one off the network as an unknown site. Text with a `/questions/`
  * path and no host before it (`/questions/88490`) yields the ID alone. A host
- * must contain a dot, so `unix/questions/1` is a path, not a host. Returns
- * null when the text holds no `/questions/{id}`.
+ * must hold two labels, so `unix/questions/1` and `./questions/1` are paths,
+ * not hosts. Returns null when the text holds no `/questions/{id}`.
  */
 function parseQuestionIdOrUrl(input: string): { questionId: number; host?: string } | null {
   const trimmed = input.trim();
@@ -54,7 +54,9 @@ function parseQuestionIdOrUrl(input: string): { questionId: number; host?: strin
   const questionId = parseInt(ref[1], 10);
   const authority = AUTHORITY_BEFORE.exec(trimmed.slice(0, ref.index))?.[1];
   const hostname = authority ? URL.parse(`https://${authority}`)?.hostname : undefined;
-  return hostname?.includes('.') ? { questionId, host: bareHost(hostname) } : { questionId };
+  const host = hostname === undefined ? undefined : bareHost(hostname);
+  // Two non-empty labels at least, so `.` and `..` stay relative-path segments.
+  return host && /[^.]\.[^.]/.test(host) ? { questionId, host } : { questionId };
 }
 
 /**

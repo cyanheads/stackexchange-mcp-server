@@ -1622,6 +1622,11 @@ describe('get_thread site resolution — a URL carries its site', () => {
     '/questions/88490/how-do-i-use-a-heredoc',
     // No scheme in front of the inner host, so nothing marks where it starts.
     'https://web.archive.org/web/2020/unix.stackexchange.com/questions/88490/x',
+    // `.` and `..` are relative-path segments, not hosts.
+    './questions/88490',
+    '../questions/88490',
+    'see ./questions/88490',
+    'https://./questions/88490',
   ])('reads the hostless /questions/ path %s from site', async (questionIdOrUrl) => {
     const { sent } = recordThreadFetch();
 
@@ -1633,6 +1638,23 @@ describe('get_thread site resolution — a URL carries its site', () => {
     expect(result.isError).toBeFalsy();
     expect(sent.map((r) => r.site)).toEqual(['unix', 'unix']);
     expect((result.structuredContent as { siteConflict?: unknown }).siteConflict).toBeUndefined();
+    expect(allText(result)).not.toContain('is not a Stack Exchange site');
+  });
+
+  it.each([
+    '/questions/88490/how-do-i-use-a-heredoc',
+    './questions/88490',
+    '../questions/88490',
+    'see ./questions/88490',
+    'https://./questions/88490',
+  ])('reads the hostless /questions/ path %s from the default site', async (questionIdOrUrl) => {
+    const { sent } = recordThreadFetch();
+
+    const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl });
+
+    expect(result.isError).toBeFalsy();
+    expect(sent.map((r) => r.site)).toEqual(['stackoverflow', 'stackoverflow']);
+    expect((result.structuredContent as { title: string }).title).toBe(ASP_NET_TITLE);
   });
 
   it.each([
@@ -1646,6 +1668,9 @@ describe('get_thread site resolution — a URL carries its site', () => {
     ['<unix.stackexchange.com/questions/88490>', 'unix.stackexchange.com'],
     ['see unix.stackexchange.com/questions/88490', 'unix.stackexchange.com'],
     ['[heredoc](unix.stackexchange.com/questions/88490)', 'unix.stackexchange.com'],
+    ['"unix.stackexchange.com/questions/88490"', 'unix.stackexchange.com'],
+    ["'unix.stackexchange.com/questions/88490'", 'unix.stackexchange.com'],
+    ['`unix.stackexchange.com/questions/88490`', 'unix.stackexchange.com'],
   ])('takes the host in front of /questions/ in %s', async (questionIdOrUrl, host) => {
     const { sent } = recordThreadFetch();
 
