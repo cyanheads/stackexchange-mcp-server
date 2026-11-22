@@ -101,6 +101,8 @@ const wireError = (result: ToolResult): WireError => {
 
 /** The markdown surface — `content[0].text`, read by format()-only clients. */
 const wireText = (result: ToolResult): string => (result.content[0] as { text: string }).text;
+const allWireText = (result: ToolResult): string =>
+  result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
 
 /**
  * Assert both surfaces carry one reason's contract recovery: `data.recovery.hint`
@@ -149,6 +151,370 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
+});
+
+const primaryLookups = [
+  {
+    label: 'question',
+    definition: stackexchangeGetThread,
+    reason: 'question_not_found',
+    call: () => runToolContract(stackexchangeGetThread, { questionIdOrUrl: '1' }),
+  },
+  {
+    label: 'user',
+    definition: stackexchangeGetUser,
+    reason: 'user_not_found',
+    call: () => runToolContract(stackexchangeGetUser, { userId: 1 }),
+  },
+];
+
+describe('multi-read quota precedence', () => {
+  it.each(primaryLookups)(
+    'reports exhausted quota before a missing $label',
+    async ({ call, definition }) => {
+      const fetchSpy = mockFetch(() => seOk({ items: [], quota_remaining: 0 }));
+      const result = await call();
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(wireError(result).data?.reason).toBe('quota_exceeded');
+      expectRecoveryParity(result, definition, 'quota_exceeded');
+    },
+  );
+});
+
+describe('multi-read lookup results', () => {
+  it.each(primaryLookups)(
+    'reports a missing $label before a sibling request can mask it',
+    async ({ call, definition, reason }) => {
+      const fetchSpy = mockFetch(() => seBadParameter('ids'));
+      fetchSpy.mockImplementationOnce(async () => seOk({ items: [] }));
+      const result = await call();
+
+      expect(wireError(result).data?.reason).toBe(reason);
+      expectRecoveryParity(result, definition, reason);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('reports quota from the answer-tag lookup even when no tags remain', async () => {
+    const fetchSpy = mockFetch(() => seOk({ items: [], quota_remaining: 0, quota_max: 301 }));
+    fetchSpy.mockImplementationOnce(async () =>
+      seOk({
+        items: [
+          {
+            user_id: 1,
+            display_name: 'User',
+            link: 'https://stackoverflow.com/users/1',
+            reputation: 1,
+          },
+        ],
+      }),
+    );
+    const result = await runToolContract(stackexchangeGetUser, { userId: 1 });
+
+    expect(result.structuredContent).toMatchObject({
+      topTags: [],
+      quotaRemaining: 0,
+      quotaMax: 301,
+    });
+    expect(allWireText(result)).toContain('**Quota Remaining:** 0');
+    expect(allWireText(result)).toContain('**Quota Max:** 301');
+  });
+});
+
+describe('discovery compatibility', () => {
+  it('browses page 2 with an empty query, retaining other search criteria', async () => {
+    const fetchSpy = mockFetch(() => seOk({ items: [] }));
+    const result = await runToolContract(stackexchangeSearchQuestions, {
+      query: '',
+      page: 2,
+      sort: 'newest',
+      tags: ['python'],
+      acceptedOnly: true,
+    });
+
+    const url = new URL(String(fetchSpy.mock.calls[0]?.[0]));
+    expect(url.pathname).toBe('/2.3/search/advanced');
+    expect(url.searchParams.has('q')).toBe(false);
+    expect(url.searchParams.get('page')).toBe('2');
+    expect(url.searchParams.get('sort')).toBe('creation');
+    expect(url.searchParams.get('tagged')).toBe('python');
+    expect(url.searchParams.get('accepted')).toBe('True');
+    expect(result.structuredContent).toMatchObject({ page: 2, questions: [] });
+  });
+
+  it('keeps sparse sites discoverable on a second catalog page', async () => {
+    const fetchSpy = mockFetch(() =>
+      seOk({
+        items: [
+          {
+            name: 'Cross Validated',
+            api_site_parameter: 'stats',
+            site_url: 'https://stats.stackexchange.com',
+          },
+        ],
+      }),
+    );
+    fetchSpy.mockImplementationOnce(async () => seOk({ items: [], has_more: true }));
+    const result = await runToolContract(stackexchangeListSites, { filter: 'stats' });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(new URL(String(fetchSpy.mock.calls[1]?.[0])).searchParams.get('page')).toBe('2');
+    expect(result.structuredContent).toMatchObject({
+      sites: [{ apiSiteParameter: 'stats' }],
+      totalCount: 1,
+    });
+    expect(wireText(result)).toContain('Cross Validated');
+  });
+});
+
+describe('discovery fixes on both wire surfaces', () => {
+  it.each([false, true])('reads the answer-ranked tags (empty: %s)', async (empty) => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith('/225312')) {
+        return seOk({
+          items: [
+            {
+              user_id: 225312,
+              display_name: 'User',
+              link: 'https://stackoverflow.com/users/225312',
+              reputation: 1,
+            },
+          ],
+        });
+      }
+      if (path.endsWith('/top-answer-tags')) {
+        return seOk({
+          items: empty
+            ? []
+            : [
+                { tag_name: 'regex', answer_score: 577, answer_count: 4 },
+                { tag_name: 'bash', answer_score: 473, answer_count: 2 },
+              ],
+        });
+      }
+      return seOk({ items: [{ tag_name: 'progress-bar', answer_count: 0, question_score: 597 }] });
+    });
+    const result = await runToolContract(stackexchangeGetUser, { userId: 225312, site: '  ' });
+    const urls = fetchSpy.mock.calls.map(([input]) => new URL(String(input)));
+
+    expect(urls.map((url) => url.pathname)).toEqual([
+      '/2.3/users/225312',
+      '/2.3/users/225312/top-answer-tags',
+    ]);
+    expect(urls.map((url) => url.searchParams.get('site'))).toEqual([
+      'stackoverflow',
+      'stackoverflow',
+    ]);
+    expect(urls[1]?.searchParams.get('pagesize')).toBe('10');
+    expect(result.structuredContent).toHaveProperty(
+      'topTags',
+      empty
+        ? []
+        : [
+            { tagName: 'regex', answerScore: 577, answerCount: 4 },
+            { tagName: 'bash', answerScore: 473, answerCount: 2 },
+          ],
+    );
+    expect(wireText(result)).toContain(
+      empty
+        ? 'No top tags by answer score'
+        : 'regex · score: 577 · 4 answers\n- bash · score: 473 · 2 answers',
+    );
+  });
+
+  it.each(['', '  '])('reports an invalid FAQ tag locally for %j', async (tag) => {
+    const fetchSpy = mockFetch(() => seOk({ items: [] }));
+    const result = await runToolContract(stackexchangeGetTagFaq, { tag });
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(wireError(result).code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(wireError(result).data?.reason).toBe('invalid_tag');
+    expect(wireText(result)).toContain('invalid_tag');
+    expectRecoveryParity(result, stackexchangeGetTagFaq, 'invalid_tag');
+  });
+
+  it('uses the effective FAQ tag and site on requests and responses', async () => {
+    const fetchSpy = mockFetch(() => seOk({ items: [] }));
+    const result = await runToolContract(stackexchangeGetTagFaq, { tag: ' c++ ', site: '' });
+    const url = new URL(String(fetchSpy.mock.calls[0]?.[0]));
+
+    expect(url.pathname).toBe('/2.3/tags/c%2B%2B/faq');
+    expect(url.searchParams.get('site')).toBe('stackoverflow');
+    expect(result.structuredContent).toMatchObject({ tag: 'c++', site: 'stackoverflow' });
+    expect(wireText(result)).toContain('FAQ: c++ on stackoverflow');
+  });
+
+  it.each([
+    ['  ', ['', '  '], undefined, undefined, 'No query or tag filter'],
+    ['  ', [' python ', '  '], undefined, 'python', 'tagged questions'],
+    [' heredoc ', [' bash ', ''], 'heredoc', 'bash', 'heredoc'],
+  ] as const)(
+    'normalizes search filters before the request for %j and %j',
+    async (query, tags, q, tagged, notice) => {
+      const fetchSpy = mockFetch(() => seOk({ items: [] }));
+      const result = await runToolContract(stackexchangeSearchQuestions, {
+        query,
+        tags: [...tags],
+        site: '  ',
+        page: 2,
+      });
+      const url = new URL(String(fetchSpy.mock.calls[0]?.[0]));
+
+      expect(url.searchParams.get('q')).toBe(q ?? null);
+      expect(url.searchParams.get('tagged')).toBe(tagged ?? null);
+      expect(url.searchParams.get('site')).toBe('stackoverflow');
+      expect(result.structuredContent).toMatchObject({
+        page: 2,
+        questions: [],
+        notice: expect.stringContaining(notice),
+      });
+      expect(result.structuredContent).toHaveProperty(
+        'notice',
+        expect.stringContaining('past the end'),
+      );
+      expect(allText(result)).toContain(notice);
+      expect(allText(result)).not.toContain('""');
+    },
+  );
+
+  it('keeps the browse notice on a capped results page', async () => {
+    mockFetch(() =>
+      seOk({
+        has_more: true,
+        items: [
+          {
+            question_id: 1,
+            title: 'First question',
+            link: 'https://stackoverflow.com/q/1',
+            score: 1,
+            answer_count: 0,
+            is_answered: false,
+            tags: [],
+          },
+        ],
+      }),
+    );
+    const result = await runToolContract(stackexchangeSearchQuestions, { query: '', pageSize: 1 });
+
+    expect(result.structuredContent).toMatchObject({ truncated: true, shown: 1, cap: 1 });
+    expect(result.structuredContent).toHaveProperty(
+      'notice',
+      expect.stringContaining('No query or tag filter'),
+    );
+    expect(result.structuredContent).toHaveProperty('notice', expect.stringContaining('page 2'));
+    expect(allText(result)).toContain('No query or tag filter');
+    expect(allText(result)).toContain('page 2');
+  });
+
+  it.each([
+    [undefined, ['stats', 'sparse', 'preview'], true],
+    ['   ', ['stats', 'sparse', 'preview'], true],
+    ['statistics', ['stats'], true],
+    ['META statistics', ['stats', 'stats.meta'], false],
+    ['meta', ['stats', 'sparse', 'preview', 'stats.meta'], false],
+    ['moderation', [], true],
+    ['metadata', [], true],
+  ] as const)('discovers sites with filter %j', async (filter, ids, omitted) => {
+    const fetchSpy = mockFetch(() =>
+      seOk({
+        items: [
+          {
+            name: 'Cross Validated Meta',
+            api_site_parameter: 'stats.meta',
+            site_url: 'https://stats.meta.stackexchange.com',
+            audience: 'statistics moderation metadata',
+            site_type: 'meta_site',
+          },
+        ],
+      }),
+    );
+    fetchSpy.mockImplementationOnce(async () =>
+      seOk({
+        has_more: true,
+        items: [
+          {
+            name: 'Cross Validated',
+            api_site_parameter: 'stats',
+            site_url: 'https://stats.stackexchange.com',
+            audience: 'people interested in statistics',
+            site_type: 'main_site',
+          },
+          {
+            name: 'Sparse',
+            api_site_parameter: 'sparse',
+            site_url: 'https://sparse.stackexchange.com',
+          },
+          {
+            name: 'Preview',
+            api_site_parameter: 'preview',
+            site_url: 'https://preview.stackexchange.com',
+            site_type: 'preview_site',
+          },
+        ],
+      }),
+    );
+    const result = await runToolContract(
+      stackexchangeListSites,
+      filter === undefined ? {} : { filter },
+    );
+    const { sites } = stackexchangeListSites.output.parse(result.structuredContent);
+    const rendered = allText(result);
+
+    expect(stackexchangeListSites.annotations?.openWorldHint).toBe(true);
+    expect(sites.map((site) => site.apiSiteParameter)).toEqual(ids);
+    expect(result.structuredContent).toHaveProperty('totalCount', ids.length);
+    for (const site of sites) {
+      if (site.apiSiteParameter === 'sparse') expect(site).not.toHaveProperty('siteType');
+    }
+    if (sites.some((site) => site.apiSiteParameter === 'preview')) {
+      expect(sites.find((site) => site.apiSiteParameter === 'preview')).toHaveProperty(
+        'siteType',
+        'preview_site',
+      );
+      expect(rendered).toContain('preview_site');
+    }
+    if (sites.some((site) => site.apiSiteParameter === 'stats.meta')) {
+      expect(sites.find((site) => site.apiSiteParameter === 'stats.meta')).toHaveProperty(
+        'siteType',
+        'meta_site',
+      );
+      expect(rendered).toContain('meta_site');
+    }
+    if (omitted) {
+      expect(result.structuredContent).toHaveProperty(
+        'notice',
+        expect.stringContaining('1 matching meta site'),
+      );
+      expect(rendered).toContain('1 matching meta site');
+    }
+  });
+
+  it('combines partial catalog and meta omission notices', async () => {
+    const fetchSpy = mockFetch(() => seOk({ items: [], has_more: true }));
+    fetchSpy.mockImplementationOnce(async () =>
+      seOk({
+        has_more: true,
+        items: [
+          {
+            name: 'Meta Stack Overflow',
+            api_site_parameter: 'meta.stackoverflow',
+            site_url: 'https://meta.stackoverflow.com',
+            site_type: 'meta_site',
+          },
+        ],
+      }),
+    );
+    const result = await runToolContract(stackexchangeListSites, { filter: 'stackoverflow' });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(10);
+    expect(result.structuredContent).toMatchObject({ sites: [], totalCount: 0 });
+    for (const phrase of ['partial', '1 matching meta site']) {
+      expect(result.structuredContent).toHaveProperty('notice', expect.stringContaining(phrase));
+      expect(allText(result)).toContain(phrase);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -567,6 +933,21 @@ const wireThread = (result: ToolResult): WireThread => {
 };
 
 describe('get_thread comments on the wire', () => {
+  it.each([
+    './questions/11227809',
+    'unix/questions/11227809',
+    'https://stackoverflow.com/questions/11227809/title#comments',
+  ])('reads the question without an answer lookup for legacy input %s', async (questionIdOrUrl) => {
+    const fetchSpy = mockThreadFetch({});
+    const result = await runToolContract(stackexchangeGetThread, { questionIdOrUrl });
+    expect(wireThread(result).answers.map((answer) => answer.answerId)).toEqual([
+      ANSWER_A,
+      ANSWER_B,
+    ]);
+    expect(wireText(result)).toContain(`**Question ID:** ${QUESTION_ID}`);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
   it('costs no extra call and carries no comments by default', async () => {
     const fetchSpy = mockThreadFetch({});
 
@@ -756,6 +1137,349 @@ describe('get_thread comments on the wire', () => {
     expect(error.data?.reason).toBe('invalid_parameter');
     expect(declaredReasons(stackexchangeGetThread)).toContain(error.data?.reason);
     expectRecoveryParity(result, stackexchangeGetThread, 'invalid_parameter');
+  });
+});
+
+describe('get_thread Share URLs and continuations', () => {
+  const question = {
+    question_id: QUESTION_ID,
+    title: 'Question',
+    link: 'https://stackoverflow.com/q/11227809',
+    score: 1,
+    answer_count: 4,
+    accepted_answer_id: ANSWER_A,
+    tags: [],
+    body: '<p>Question body.</p>',
+  };
+  const answer = (id: number, parent = QUESTION_ID) => ({
+    answer_id: id,
+    question_id: parent,
+    is_accepted: id === ANSWER_A,
+    score: id === ANSWER_A ? 1 : id,
+    body: `<p>Body ${id}.</p>`,
+  });
+  const linked = 11227807;
+
+  it.each([false, true])(
+    'reports the last successful quota when linked comments fail: %s',
+    async (fail) => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith(`/answers/${linked}/comments`)) {
+          return fail
+            ? seBadParameter('ids')
+            : seOk({ items: [], quota_remaining: 92, quota_max: 302 });
+        }
+        if (path.endsWith(`/answers/${linked}`)) {
+          return seOk({ items: [answer(linked)], quota_remaining: 93, quota_max: 301 });
+        }
+        if (path.endsWith('/comments')) return seOk({ items: [], quota_remaining: 94 });
+        if (path.endsWith('/answers')) return seOk({ items: [answer(ANSWER_A)] });
+        return seOk({ items: [question] });
+      });
+      const result = await runToolContract(stackexchangeGetThread, {
+        questionIdOrUrl: `https://stackoverflow.com/questions/${QUESTION_ID}/title/${linked}#${linked}`,
+        includeComments: true,
+      });
+      const latest = fail
+        ? { quotaRemaining: 93, quotaMax: 301 }
+        : { quotaRemaining: 92, quotaMax: 302 };
+
+      expect(fetchSpy).toHaveBeenCalledTimes(6);
+      expect(wireThread(result).answers.map((item) => item.answerId)).toContain(linked);
+      expect(result.structuredContent).toMatchObject(latest);
+      expect(allWireText(result)).toContain(`**Quota Remaining:** ${latest.quotaRemaining}`);
+      expect(allWireText(result)).toContain(`**Quota Max:** ${latest.quotaMax}`);
+      if (fail)
+        expect(allWireText(result)).toContain('Could not read the linked answer’s comments');
+    },
+  );
+
+  const fetchThread = (linkedResponse = () => seOk({ items: [answer(linked)] })) =>
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      const page = url.searchParams.get('page');
+      if (url.pathname.endsWith(`/answers/${linked}`)) return linkedResponse();
+      if (url.pathname.endsWith(`/answers/${ANSWER_A}`)) return seOk({ items: [answer(ANSWER_A)] });
+      if (url.pathname.endsWith('/answers')) {
+        return seOk({
+          items: page === '3' ? [] : [answer(page === '2' ? ANSWER_B - 10 : ANSWER_B)],
+          has_more: page !== '3',
+        });
+      }
+      if (url.pathname.endsWith('/comments')) {
+        const postId = url.pathname.split('/').at(-2);
+        return seOk({
+          has_more: page !== '2' && postId === String(QUESTION_ID),
+          items:
+            page === '2' || postId !== String(linked)
+              ? []
+              : [{ comment_id: 123, post_id: linked, body: 'Linked comment.', score: 1 }],
+        });
+      }
+      return seOk({ items: [question] });
+    });
+
+  it.each([
+    ['https://stackoverflow.com/a/11227807/987', 'stackoverflow.com'],
+    ['https://stackoverflow.com/questions/11227809/title/11227807#11227807', 'stackoverflow.com'],
+  ])('merges the target for %s alongside the accepted answer', async (questionIdOrUrl, site) => {
+    const fetchSpy = fetchThread();
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl,
+      maxAnswers: 1,
+    });
+    expect(wireThread(result).answers.map((a) => a.answerId)).toEqual([ANSWER_A, ANSWER_B, linked]);
+    expect(wireText(result)).toContain(`Body ${linked}.`);
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    expect(
+      fetchSpy.mock.calls.map(([url]) => new URL(String(url)).searchParams.get('site')),
+    ).toEqual([site, site, site, site]);
+  });
+
+  it('uses the site from /q links', async () => {
+    const fetchSpy = fetchThread();
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: `https://unix.stackexchange.com/q/${QUESTION_ID}/987`,
+    });
+    expect(wireThread(result).answers[0]?.answerId).toBe(ANSWER_A);
+    expect(wireText(result)).toContain(`**Question ID:** ${QUESTION_ID}`);
+    expect(
+      fetchSpy.mock.calls.every(([url]) => String(url).includes('site=unix.stackexchange.com')),
+    ).toBe(true);
+  });
+
+  it('resolves an answer Share URL on the supplied fallback site if SE refuses its host', async () => {
+    const fetchSpy = fetchThread();
+    const fixture = fetchSpy.getMockImplementation()!;
+    fetchSpy.mockImplementation(async (input, init) =>
+      new URL(String(input)).searchParams.get('site') === 'proxy.example'
+        ? seBadParameter('No site found for name proxy.example')
+        : fixture(input, init),
+    );
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: `https://proxy.example/a/${linked}/987`,
+      site: 'stackoverflow',
+    });
+    expect(wireThread(result).answers.map((item) => item.answerId)).toContain(linked);
+    expect(result.structuredContent).toMatchObject({
+      siteConflict: { resolvedBy: 'site', site: 'stackoverflow', urlHost: 'proxy.example' },
+    });
+    expect(allWireText(result)).toContain('the question was read from site');
+    const sites = fetchSpy.mock.calls.map(([url]) => new URL(String(url)).searchParams.get('site'));
+    expect(sites).toEqual(['proxy.example', ...Array(4).fill('stackoverflow')]);
+  });
+
+  it('deduplicates a short target that is also accepted', async () => {
+    const fetchSpy = fetchThread();
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: `https://stackoverflow.com/a/${ANSWER_A}`,
+      maxAnswers: 1,
+    });
+    expect(wireThread(result).answers.map((a) => a.answerId)).toEqual([ANSWER_A, ANSWER_B]);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('reports a missing short target as answer_not_found on both surfaces', async () => {
+    const fetchSpy = fetchThread(() => seOk({ items: [] }));
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: `https://stackoverflow.com/a/${linked}`,
+    });
+    expect(wireError(result).data?.reason).toBe('answer_not_found');
+    expectRecoveryParity(result, stackexchangeGetThread, 'answer_not_found');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['missing', () => seOk({ items: [] })],
+    ['foreign', () => seOk({ items: [answer(linked, 10)] })],
+    ['unavailable', () => new Response(null, { status: 503 })],
+    ['throttled', () => new Response(null, { status: 429, headers: { 'Retry-After': '60' } })],
+  ])(
+    'returns the question and baseline comments when a long target is %s',
+    async (failure, reply) => {
+      const fetchSpy = fetchThread(reply);
+      const result = await runToolContract(stackexchangeGetThread, {
+        questionIdOrUrl: `https://stackoverflow.com/questions/${QUESTION_ID}/title/${linked}#${linked}`,
+        maxAnswers: 1,
+        includeComments: true,
+      });
+      expect(wireThread(result).answers.map((a) => a.answerId)).toEqual([ANSWER_A, ANSWER_B]);
+      expect(wireThread(result).comments).toEqual([]);
+      const paths = fetchSpy.mock.calls.map(([url]) => new URL(String(url)).pathname);
+      expect(paths).toHaveLength(6);
+      expect(paths.at(-2)).toMatch(/\/comments$/);
+      expect(paths.at(-1)).toBe(`/2.3/answers/${linked}`);
+      if (failure === 'unavailable' || failure === 'throttled') {
+        const notice =
+          'Continue with answersPage: 2 and keep maxAnswers at 1. Could not read the linked answer from Stack Exchange.';
+        expect(result.structuredContent).toMatchObject({ notice });
+        expect(allWireText(result)).toContain(notice);
+      }
+    },
+  );
+
+  it('preserves caller cancellation during an optional answer fetch', async () => {
+    const controller = new AbortController();
+    fetchThread(() => {
+      controller.abort();
+      return new Response(null, { status: 503 });
+    });
+    const result = await runToolContract(
+      stackexchangeGetThread,
+      {
+        questionIdOrUrl: `https://stackoverflow.com/questions/${QUESTION_ID}/title/${linked}`,
+      },
+      { context: { signal: controller.signal } },
+    );
+    expect(wireError(result).code).toBe(JsonRpcErrorCode.RequestCancelled);
+  });
+
+  it('keeps a long linked target on later pages without injecting the accepted answer', async () => {
+    const fetchSpy = fetchThread();
+    const result = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: `https://stackoverflow.com/questions/${QUESTION_ID}/title/${linked}`,
+      maxAnswers: 1,
+      answersPage: 2,
+      includeComments: true,
+    });
+    const thread = wireThread(result);
+    expect(thread.answers.map((a) => a.answerId)).toEqual([linked, ANSWER_B - 10]);
+    expect(thread.answers[0]?.comments?.map((comment) => comment.commentId)).toEqual([123]);
+    expect(wireText(result)).toContain('Linked comment.');
+    expect(fetchSpy).toHaveBeenCalledTimes(6);
+  });
+
+  it('splits 102 distinct answer IDs into stable comment batches of 100 and 2', async () => {
+    const fetchSpy = fetchThread();
+    const fixture = fetchSpy.getMockImplementation()!;
+    const ids = Array.from({ length: 100 }, (_, index) => index + 1);
+    fetchSpy.mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/answers')) {
+        return seOk({ items: ids.map((id) => answer(id)), has_more: true });
+      }
+      if (url.pathname.endsWith('/comments') && url.pathname.includes('/answers/')) {
+        const batch = url.pathname.split('/').at(-2)!.split(';').map(Number);
+        const post = batch.at(-1)!;
+        return seOk({
+          items: [{ comment_id: post + 100, post_id: post, body: `For ${post}.`, score: 1 }],
+          has_more: batch.length === 2 && url.searchParams.get('page') !== '2',
+        });
+      }
+      return fixture(input, init);
+    });
+    const params = {
+      questionIdOrUrl: `https://stackoverflow.com/a/${linked}`,
+      maxAnswers: 100,
+      includeComments: true,
+    };
+    const first = await runToolContract(stackexchangeGetThread, params);
+    const data = wireThread(first);
+    expect(data.answers).toHaveLength(102);
+    expect(data.answers[0]?.answerId).toBe(ANSWER_A);
+    expect(data.answers[0]?.comments).toEqual([
+      expect.objectContaining({ commentId: ANSWER_A + 100 }),
+    ]);
+    expect(data.answers.find((item) => item.answerId === 100)?.comments).toEqual([
+      expect.objectContaining({ commentId: 200 }),
+    ]);
+    expect(data.answers.find((item) => item.answerId === linked)?.comments).toBeUndefined();
+    expect(first.structuredContent).toMatchObject({ nextAnswerCommentsPage: 2, commentsCap: 100 });
+    expect(allWireText(first)).toContain('at least one answer batch');
+    const batches = () =>
+      fetchSpy.mock.calls
+        .map(([url]) => new URL(String(url)))
+        .filter((url) => url.pathname.includes('/answers/') && url.pathname.endsWith('/comments'))
+        .map((url) => [
+          url.pathname,
+          url.searchParams.get('page'),
+          url.searchParams.get('pagesize'),
+        ]);
+    const firstBatches = batches();
+    expect(firstBatches).toEqual([
+      [`/2.3/answers/${ids.join(';')}/comments`, null, '100'],
+      [`/2.3/answers/${linked};${ANSWER_A}/comments`, null, '100'],
+    ]);
+    expect(fetchSpy).toHaveBeenCalledTimes(7);
+    fetchSpy.mockClear();
+
+    const second = await runToolContract(stackexchangeGetThread, { ...params, commentsPage: 2 });
+    expect(batches()).toEqual(firstBatches.map(([path]) => [path, '2', '100']));
+    expect(second.structuredContent).not.toHaveProperty('nextAnswerCommentsPage');
+    expect(
+      wireThread(second).answers.find((item) => item.answerId === linked)?.comments,
+    ).toBeUndefined();
+    expect(wireText(second)).not.toContain('No comments.');
+  });
+
+  it.each(['answersPage', 'commentsPage'])(
+    'declares the keyless %s limit and rejects page 0',
+    async (field) => {
+      const options = { questionIdOrUrl: String(QUESTION_ID), includeComments: true };
+      const invalid = await runToolContract(stackexchangeGetThread, { ...options, [field]: 0 });
+      expect(invalid.isError).toBe(true);
+      expect(wireText(invalid)).toContain(field);
+
+      const fetchSpy = fetchThread();
+      const fixture = fetchSpy.getMockImplementation();
+      fetchSpy.mockImplementation(async (input, init) =>
+        new URL(String(input)).searchParams.get('page') === '26'
+          ? new Response(
+              JSON.stringify({
+                error_id: 403,
+                error_name: 'access_denied',
+                error_message: 'page above 25 requires access token or app key',
+              }),
+              { status: 400 },
+            )
+          : fixture!(input, init),
+      );
+      const result = await runToolContract(stackexchangeGetThread, { ...options, [field]: 26 });
+      expect(wireError(result).data?.reason).toBe('paging_depth_limit');
+      expectRecoveryParity(result, stackexchangeGetThread, 'paging_depth_limit');
+    },
+  );
+
+  it('names the next answers and comments pages, then reports an empty later slice', async () => {
+    const fetchSpy = fetchThread();
+    const first = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: String(QUESTION_ID),
+      maxAnswers: 1,
+      includeComments: true,
+    });
+    expect(first.structuredContent).toMatchObject({
+      nextAnswersPage: 2,
+      nextQuestionCommentsPage: 2,
+      notice: expect.stringContaining('answersPage: 2'),
+    });
+    const text = allWireText(first);
+    expect(text).not.toContain('Raise the cap');
+    expect(text).toContain('answersPage: 2');
+    expect(text).toContain('commentsPage: 2');
+    fetchSpy.mockClear();
+
+    const later = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: String(QUESTION_ID),
+      maxAnswers: 1,
+      answersPage: 2,
+      includeComments: true,
+      commentsPage: 2,
+    });
+    expect(wireThread(later).answers.map((a) => a.answerId)).toEqual([ANSWER_B - 10]);
+    expect(wireThread(later).answers[0]?.comments).toBeUndefined();
+    expect(later.structuredContent).not.toHaveProperty('nextQuestionCommentsPage');
+    expect(wireText(later)).not.toContain('No comments.');
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+
+    const end = await runToolContract(stackexchangeGetThread, {
+      questionIdOrUrl: String(QUESTION_ID),
+      maxAnswers: 1,
+      answersPage: 3,
+    });
+    expect(wireThread(end).answers).toEqual([]);
+    expect(end.structuredContent).toMatchObject({ answersPage: 3 });
+    expect(wireText(end)).toContain('No answers on page 3');
   });
 });
 
@@ -989,19 +1713,22 @@ describe('throttling on the wire', () => {
 
   it.each(TOOL_CALLS)('pacer_shed on %s', async (_name, def, run) => {
     vi.useFakeTimers();
+    const first = Promise.withResolvers<Response>();
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockRejectedValue(new Error('unmocked fetch'))
-      .mockImplementationOnce(async () => seOk({ items: [], backoff: 40 }))
+      .mockReturnValueOnce(first.promise)
       .mockImplementationOnce(hangUntilAborted);
 
-    await runToolContract(stackexchangeListSites, {});
-    // Sleeps the 40s backoff in the pacer's slot, then hangs there past the
-    // queued call's wait budget.
+    // Two actual requests hold the shared slot past the queued call's wait budget.
+    const initial = runToolContract(stackexchangeListSites, {});
     const holder = runToolContract(stackexchangeListSites, {});
     const pending = run();
-    await vi.advanceTimersByTimeAsync(50_001);
-    const [result] = await Promise.all([pending, holder]);
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    first.resolve(seOk({ items: [] }));
+    await vi.advanceTimersByTimeAsync(25_001);
+    const [result] = await Promise.all([pending, initial, holder]);
 
     const error = wireError(result);
     expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
@@ -1262,7 +1989,10 @@ describe('get_thread site resolution — unchanged shapes (characterization)', (
 
     expect(result.isError).toBeFalsy();
     expect(sent.map((r) => [r.path, r.params])).toEqual([
-      ['/questions/11227809', { site: 'stackoverflow', filter: 'withbody' }],
+      [
+        '/questions/11227809',
+        { site: 'stackoverflow', filter: '!2vHqlW)1idY*y*4O4HFN67yFvg7vfdDXn)ZlC0*rKy' },
+      ],
       [
         '/questions/11227809/answers',
         { site: 'stackoverflow', filter: 'withbody', sort: 'votes', pagesize: '10' },

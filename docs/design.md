@@ -7,10 +7,10 @@
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
 | `stackexchange_search_questions` | Search questions across a Stack Exchange site. Returns ranked questions with title, score, answer count, accepted status, tags, ask and last-activity dates, and a prose excerpt — no full bodies at this stage. Entry point; results supply `question_id` for `stackexchange_get_thread`. Reports the sort applied (`appliedSort`), with `sortOverrideReason` when a score threshold forced `votes` over the requested sort. | `query` (string), `site` (default `stackoverflow`), `tags` (string[]), `acceptedOnly` (bool), `minScore` (int), `sort` (enum: relevance\|votes\|activity\|newest), `pageSize` (max 30), `page` (1-based) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `stackexchange_get_thread` | Fetch a complete Q&A thread — question body and all answers, accepted answer first then sorted by score, rendered as clean markdown with fenced code blocks. Accepts an integer question ID, read from `site`, or a full Stack Exchange question URL, read from the site its host names (e.g., `https://unix.stackexchange.com/questions/88490/how-do-i-use-a-heredoc` or `https://stackoverflow.com/questions/11227809/title#answerAnchor` — the integer immediately following `/questions/`). The HTML→markdown normalization and the `withbody` filter are baked in; one call replaces fetch-question + fetch-answers + strip-HTML + rank. Attribution (author + link) included per CC BY-SA. | `questionIdOrUrl` (string), `site` (optional; for a numeric ID, default `stackoverflow`), `includeComments` (bool, default false), `maxAnswers` (int, default 10) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `stackexchange_get_thread` | Read a question or answer URL, a page of answers and optional comments. Duplicate questions carry their original question IDs. | `questionIdOrUrl`, `site`, `includeComments`, `maxAnswers`, `answersPage`, `commentsPage` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `stackexchange_get_tag_faq` | A tag's frequently asked questions on a site — Stack Exchange's own selection, returned in its order and not sorted by score. Maps to `/tags/{tag}/faq`. Returns question list without bodies; use `stackexchange_get_thread` to read any result. | `tag` (string), `site` (default `stackoverflow`), `pageSize` (max 30), `page` (1-based) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `stackexchange_get_user` | User profile by ID: reputation, badge counts, top tags by answer score, and account metadata. Credibility context for an answer author. Makes 2 upstream calls: `/users/{id}` (profile) + `/users/{id}/top-tags`, sent one at a time through the pacer. | `userId` (int), `site` (default `stackoverflow`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `stackexchange_list_sites` | Enumerate the Stack Exchange network sites — name, `api_site_parameter`, audience, and URL. Discovery for cross-site search; the `site` param on every other tool comes from `api_site_parameter` here. Results are filtered client-side from a bounded page walk — the walk stops at a page ceiling and reports `truncated` when SE still had more to give. | `filter` (optional string, local name filter) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `stackexchange_get_user` | Read the user profile and the first ten tags from `/users/{id}/top-answer-tags` in answer-score order. | `userId`, `site` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `stackexchange_list_sites` | Search site names, API site parameters and audiences. The standalone `meta` token includes meta sites. A partial page walk is disclosed. | `filter` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 
 ### Tool Error Contracts
 
@@ -29,7 +29,7 @@ Six reasons are shared, because they arise in `fetchSe` rather than in any one t
 
 SE reports every method error on HTTP 400, so `error_name` and message shape do the classifying, not the status. Note that SE's envelope carries its own `error_id` — a `403`, `500`, `502`, or `503` there is not an HTTP status. `throttled` is also raised from a bare HTTP 429, whose `Retry-After` supplies the wait when present.
 
-`retryAfter` on `throttled` is the seconds `throttle_violation` states in its `error_message` ("more requests available in N seconds"), else the `Retry-After` header, else the pacer's cooldown gate as it stands once the rate limit has closed it. A stated wait also advances `backoffUntil`, so the next call fails `throttled` at once without a request.
+`retryAfter` reports how long the caller should wait. An IP throttle can state a delay in the `throttle_violation` envelope or `Retry-After` header. Without a stated delay, the shared pacer supplies its cooldown. A successful wrapper's `backoff` applies to subsequent requests to that API method across sites and arguments.
 
 Every tool also declares `quota_exceeded` (`RateLimited`) when `quota_remaining` reaches 0. Not retryable within the day: it carries `data.retryable: false`, so the call sends its one request and stops. Quota resets at midnight UTC, and `STACKEXCHANGE_API_KEY` lifts the ceiling to 10,000/day (Stack Exchange's default per-key daily limit).
 
@@ -40,7 +40,10 @@ Per-tool reasons on top of those:
 | `stackexchange_search_questions` | `paging_depth_limit` | `Forbidden` | `page` above 25 without a key — SE answers `error_name: "access_denied"` |
 | `stackexchange_get_tag_faq` | `paging_depth_limit` | `Forbidden` | same, on `/tags/{tag}/faq` |
 | `stackexchange_get_thread` | `question_not_found` | `NotFound` | `items[]` empty — SE answers HTTP 200 with no items rather than 404 |
-| `stackexchange_get_thread` | `invalid_id_or_url` | `ValidationError` | Input is neither an integer ID nor text holding a `/questions/{id}` path, or SE refused the ID |
+| `stackexchange_get_thread` | `invalid_id_or_url` | `ValidationError` | The input has no recognized question ID or question/answer link, or Stack Exchange refused its ID. |
+| `stackexchange_get_thread` | `answer_not_found` | `NotFound` | A short answer link names an unavailable answer. |
+| `stackexchange_get_thread` | `paging_depth_limit` | `Forbidden` | A keyless answer or comment request exceeds the upstream page limit. |
+| `stackexchange_get_tag_faq` | `invalid_tag` | `ValidationError` | The tag is blank after trimming. |
 | `stackexchange_get_user` | `user_not_found` | `NotFound` | Same empty-items pattern as questions |
 | `stackexchange_get_user` | `invalid_user_id` | `ValidationError` | `userId` above 2147483647 — SE user IDs are 32-bit signed integers |
 
@@ -62,7 +65,7 @@ None. This is a read-only data access server; no recurring interaction template 
 
 stackexchange-mcp-server gives agents access to Stack Overflow and the wider Stack Exchange network (Super User, Server Fault, Ask Ubuntu, Unix & Linux, Mathematics, DBA, etc.) and returns full Q&A threads as clean markdown — accepted answer first, code blocks intact, attribution included.
 
-The primary value-add is the HTML→markdown normalization layer. The Stack Exchange API returns question and answer bodies only when a `filter=withbody` parameter is supplied, and the bodies are HTML. Without this server, agents either call the API without bodies (getting no content) or get raw HTML they must parse themselves. This server bakes in the filter and normalizes the output.
+The Stack Exchange API serves HTML post bodies when the method's filter includes `body`. The server normalizes those fragments to Markdown and preserves attribution.
 
 Wraps the Stack Exchange API v2.3 (`https://api.stackexchange.com/docs`). Read-only; no OAuth or user auth required.
 
@@ -71,8 +74,8 @@ Wraps the Stack Exchange API v2.3 (`https://api.stackexchange.com/docs`). Read-o
 ## Requirements
 
 - Search questions across any SE site via full-text + tag/score/accepted filters
-- Fetch complete Q&A threads (question + all answers) as clean markdown in one call
-- Bodies require `filter=withbody` — baked in; not exposed as a parameter
+- Read a question and its vote-ranked answers as Markdown, with continuation for answers and comments.
+- Select body fields through server-owned filters.
 - HTML→markdown normalization: `<pre><code>` → fenced code blocks, `<p>` → paragraphs, `<strong>`/`<em>` → bold/italic, `<a>` → `[text](url)`, `<ul>`/`<ol>`/`<li>` → lists, `<h1>`-`<h6>` → headers, `<blockquote>` → blockquote
 - Answers sorted: accepted answer first, then by score descending
 - Attribution in output: display name + profile link + answer score, per CC BY-SA 4.0
@@ -93,9 +96,9 @@ Wraps the Stack Exchange API v2.3 (`https://api.stackexchange.com/docs`). Read-o
 
 The `html-normalizer` is a module-private function in the service (`src/services/stackexchange/html-normalizer.ts`), not an init/accessor service — it's stateless and synchronous. The framework's `HtmlExtractor` (which uses `defuddle`/`linkedom`) is designed for full web pages and is overkill for SE's structured post snippets; a custom normalizer handles the SE tag set correctly and adds no dependency. Turndown is not needed.
 
-**Backoff tracking:** The service holds a per-process `backoffUntil` timestamp (acceptable for server-side use), advanced by a response wrapper's `backoff` and by any wait a throttle states. Every request runs through one shared pacer: one request at a time, behind a cooldown gate that a rate limit closes for 1 s, doubling on each consecutive one to a 30 s ceiling.
+**Backoff tracking.** Every upstream call shares one dispatch slot. The JSON wrapper's `backoff` holds one API method across IDs, arguments and sites. HTTP 429 and `throttle_violation` hold all methods.
 
-Every wait is held to one deadline. Each `withRetry` attempt keeps its remaining share of the 50 s `OPERATION_DEADLINE_MS` as an absolute instant, less a 1 s margin so a refusal lands before `withRetry`'s own deadline timer, and every chained request in the attempt draws on that same instant. A backoff that fits is slept while holding the pacer slot. One that outlasts the deadline fails `throttled` at once with `retryAfter` and sends nothing, checked before queueing, and again for every queued call whenever the window grows. The remaining budget is the pacer's `maxWaitMs`, so a call that would wait in the queue past it sheds with `pacer_shed`. `throttled`, 408, and 5xx failures still retry through `withRetry` while their wait fits; `quota_exceeded` and `pacer_shed` never do. A caller's cancellation passes through unchanged.
+Queueing, method waits, IP cooldowns, retries and chained requests share a 50-second operation budget. A method waiting for backoff leaves the dispatch slot available. A wait that cannot fit before the deadline returns `throttled` with `retryAfter`. A queue wait that exhausts the budget returns `pacer_shed`. Caller cancellation propagates.
 
 **Decision:** fail fast with the known wait rather than sleep into the deadline. Sleeping out a backoff the deadline cannot cover cost every caller the full 50 s and ended in `retry_deadline_exceeded`, which names no wait.
 
@@ -145,19 +148,21 @@ Each step after the service layer is independently testable with mock context.
 
 | # | Call | Purpose |
 |:--|:-----|:--------|
-| 1 | `GET /questions/{id}?filter=withbody&site={site}` | Question body + metadata |
-| 2 | `GET /questions/{id}/answers?filter=withbody&site={site}&pagesize=N&sort=votes` | All answers with bodies |
+| 1 | `GET /questions/{id}` with the thread filter | Question body, closure metadata and duplicate targets |
+| 2 | `GET /questions/{id}/answers` with `withbody`, page, page size and vote sort | Selected page of answers |
 
-Both go through the shared pacer one at a time, so each response's `backoff` applies before the next request. When a URL's host draws "No site found" and the caller passed a different `site`, call 1 is sent once more with that `site` before call 2, and a retry after a transient failure reads from that `site` directly. One more call fetches the accepted answer when it falls outside the vote-sorted page, and `includeComments` adds two more (`/questions/{id}/comments` and one batched `/answers/{ids}/comments`). After fetching, the service sorts answers: accepted first (matched via `question.accepted_answer_id`), then by score descending. Each body is normalized from HTML to markdown by `html-normalizer`. Attribution is appended to each answer block.
+A short `/a/` URL first resolves the answer's parent question. Page 1 can add an off-page accepted answer. A linked answer can also appear outside the vote-ranked page. With `includeComments`, the service reads the question's comment page and groups answer comments by `post_id` across batches of at most 100 IDs. Each page carries up to 100 comments per batch. Keep `answersPage` and `maxAnswers` fixed while advancing `commentsPage`.
+
+When a long answer URL already identifies the question, the server finishes the requested thread first. An optional lookup for an off-page linked answer and its comments shares a two-second budget within the call's deadline. If that budget or the quota runs out, the caller receives the thread with a notice identifying the missing content.
 
 `stackexchange_get_user` — 2 upstream calls, sent one at a time through the pacer:
 
 | # | Call | Purpose |
 |:--|:-----|:--------|
 | 1 | `GET /users/{id}?site={site}` | Profile: reputation, badge counts, display name, location, account metadata |
-| 2 | `GET /users/{id}/top-tags?site={site}&pagesize=10` | Top tags by answer score (separate endpoint — not included in the main user profile response) |
+| 2 | `GET /users/{id}/top-answer-tags?site={site}&pagesize=10` | Top tags by answer score |
 
-If `top-tags` returns empty (new user, no answers), the tool still returns the profile — `topTags` is an empty array. An empty profile `items[]` throws `user_not_found`.
+If the answer-tag route returns no items, the profile carries `topTags: []`. An empty profile response raises `user_not_found`.
 
 ---
 
@@ -165,9 +170,9 @@ If `top-tags` returns empty (new user, no answers), the tool still returns the p
 
 **No HTML→markdown library dependency.** SE post bodies use a predictable, limited HTML tag set (`<p>`, `<pre><code>`, `<strong>`, `<em>`, `<a>`, `<ul>`, `<ol>`, `<li>`, `<h1>`-`<h6>`, `<blockquote>`, `<code>` inline). A custom normalizer covers this in ~80 lines with no peer dependency. The framework's `HtmlExtractor` (defuddle + linkedom) is designed for full web pages and adds unnecessary complexity for fragments; `turndown` would work but adds a dep for a task this small.
 
-**`filter=withbody` is always set, never exposed.** The filter is an implementation detail the user should never need to think about. Exposing it would confuse and could produce broken calls (bodies omitted = useless output).
+**The server owns the upstream filters.** The question lookup extends `withbody` to return duplicate targets alongside the body. The search filter selects Markdown source for excerpts and closure fields for status. Answer and comment requests use `withbody`.
 
-**Accepted-answer-first ordering is hardcoded, not configurable.** The "accepted answer first" ordering is the single correct answer to "what's the best answer here?" — it's the SO community's explicit signal, not a preference. Making it optional would introduce noise for no gain.
+**Answer order.** When a page contains the accepted answer, it appears first. The remaining answers are sorted by score. Only page 1 brings in an accepted answer outside its vote-ranked page.
 
 **`list_sites` uses local filter, not upstream search.** The full SE network has 365 sites counting per-site metas — a bounded, rarely-changing list. Four pages of 100 retrieve them all. Client-side `filter` matching is appropriate here; there's no upstream search for sites.
 
@@ -193,7 +198,7 @@ If `top-tags` returns empty (new user, no answers), the tool still returns the p
 
 **Key parameters:**
 - `site` — required on most endpoints; value is `api_site_parameter` from `/sites` (e.g., `stackoverflow`, `superuser`, `serverfault`) or the site's domain (`serverfault.com`, `unix.stackexchange.com`, `ru.stackoverflow.com`, `meta.stackexchange.com`, `stackapps.com` all confirmed live)
-- `filter=withbody` — required to receive `body` field on questions and answers; absent by default
+- `filter` selects upstream fields. The thread filter includes the question body and duplicate targets.
 - `key` — optional API key to lift per-IP quota to ~10,000/day
 - `pagesize` — max 100; practical default 10–30 for thread fetches
 - `sort` — `votes`, `activity`, `creation`, `relevance` (relevance only on search endpoints)
@@ -205,7 +210,7 @@ If `top-tags` returns empty (new user, no answers), the tool still returns the p
   "has_more": true,
   "quota_max": 300,
   "quota_remaining": 291,
-  "backoff": 10  // optional — seconds to wait before next request
+  "backoff": 10  // optional wait in seconds before another request to this method
 }
 ```
 
@@ -220,9 +225,9 @@ If `top-tags` returns empty (new user, no answers), the tool still returns the p
 
 **Confirmed via live probe (2026-06-04):**
 - `filter=withbody` returns `body` field as HTML on both `/questions/{id}` and `/questions/{id}/answers`
-- Without `filter=withbody`, `body` is absent from both endpoints
+- The default filter omits post bodies.
 - `/tags/{tag}/faq` returns question list without bodies (expected; use `get_thread` for bodies), in SE's "frequently asked" order rather than by score
-- `/users/{id}` returns user profile with badge counts, reputation, but no answer list (separate `/users/{id}/top-tags`)
+- `/users/{id}` returns the user profile. Fetch `/users/{id}/top-answer-tags` for answer-score ranking.
 - Error envelope confirmed: `{ error_id, error_message, error_name }` for bad `site` param
 - Keyless quota: 300/day per IP (`quota_max: 300` in every response)
 - Responses are gzip-encoded — `Accept-Encoding: gzip` or `curl --compressed` required
@@ -235,4 +240,4 @@ If `top-tags` returns empty (new user, no answers), the tool still returns the p
 - **~300 req/day keyless.** Agents doing broad research will hit this quickly. The `STACKEXCHANGE_API_KEY` env var lifts this to ~10,000/day without any user OAuth flow; the README should make this prominent.
 - **Bodies are HTML, not Markdown.** The SE API does not provide a markdown output format. The normalizer handles SE's known tag set; edge cases (MathJax, custom SE rendering plugins, obscure HTML constructs in older posts) may produce imperfect output.
 - **No cross-site search.** The SE API requires a `site` parameter; there is no "search all sites at once" endpoint. The `list_sites` tool lets agents enumerate and search each site separately.
-- **Answer pagination.** Very popular questions can have hundreds of answers. The `get_thread` tool caps at `maxAnswers` (default 10) to stay within context budgets; a `page` parameter allows pagination but won't be in v0.1.0.
+- **Keyless page depth.** Stack Exchange refuses API pages past 25 without a key, including answer pages and comment pages.

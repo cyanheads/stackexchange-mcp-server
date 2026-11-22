@@ -1,6 +1,6 @@
 # stackexchange-mcp-server - Directory Structure
 
-Generated on: 2026-10-28 14:53:08
+Generated on: 2026-11-22 01:12:49
 
 ```text
 stackexchange-mcp-server/
@@ -33,7 +33,11 @@ stackexchange-mcp-server/
 ├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
+│   ├── add-export/
+│   │   └── SKILL.md
 │   ├── add-prompt/
+│   │   └── SKILL.md
+│   ├── add-provider/
 │   │   └── SKILL.md
 │   ├── add-resource/
 │   │   └── SKILL.md
@@ -149,16 +153,18 @@ stackexchange-mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── index.ts
-│   │           ├── stackexchange-get-tag-faq.tool.ts
-│   │           ├── stackexchange-get-thread.tool.ts
-│   │           ├── stackexchange-get-user.tool.ts
-│   │           ├── stackexchange-list-sites.tool.ts
-│   │           └── stackexchange-search-questions.tool.ts
+│   │       ├── definitions/
+│   │       │   ├── index.ts
+│   │       │   ├── stackexchange-get-tag-faq.tool.ts
+│   │       │   ├── stackexchange-get-thread.tool.ts
+│   │       │   ├── stackexchange-get-user.tool.ts
+│   │       │   ├── stackexchange-list-sites.tool.ts
+│   │       │   └── stackexchange-search-questions.tool.ts
+│   │       └── question-closure.ts
 │   ├── services/
 │   │   └── stackexchange/
 │   │       ├── html-normalizer.ts
+│   │       ├── stackexchange-pacer.ts
 │   │       ├── stackexchange-service.ts
 │   │       └── types.ts
 │   └── index.ts
@@ -173,6 +179,7 @@ stackexchange-mcp-server/
 │   ├── tools/
 │   │   ├── error-contract.wire.test.ts
 │   │   ├── inline-markdown.contract.test.ts
+│   │   ├── question-closure.contract.test.ts
 │   │   ├── stackexchange-get-tag-faq.tool.test.ts
 │   │   ├── stackexchange-get-thread.tool.test.ts
 │   │   ├── stackexchange-get-user.tool.test.ts

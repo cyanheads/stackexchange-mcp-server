@@ -6,13 +6,20 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
-import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
+import {
+  COMMENTS_PAGE_SIZE,
+  getStackExchangeService,
+  type ThreadTarget,
+} from '@/services/stackexchange/stackexchange-service.js';
+import { appendClosureStats, closureFields } from '../question-closure.js';
 
 /** The site a numeric question ID is read from when the caller names none. */
 const DEFAULT_SITE = 'stackoverflow';
 
 /** The first `/questions/{id}` anywhere in the input. */
 const QUESTION_REF = /\/questions\/(\d+)/;
+const SHARE_REF = /\/([qa])\/(\d+)(?=$|[/#?\s<>)\]"'`])/;
+const LONG_ANSWER_REF = /^\/[^/\s?#<>()[\]"'`]+\/(\d+)(?=$|[/#?\s<>)\]"'`])/;
 
 /**
  * The authority directly in front of that reference — after `//`, or, when no
@@ -36,27 +43,34 @@ const bareHost = (hostname: string): string =>
     .replace(/\.$/, '');
 
 /**
- * Parse a numeric question ID, or text holding a question URL into its ID and
- * the host in front of `/questions/`. Question IDs are per-site, so that host
- * is the only site the ID is valid on; Stack Exchange resolves it as `site`,
- * aliases included (`arqade.com`, `programmers.stackexchange.com`), and
- * rejects one off the network as an unknown site. Text with a `/questions/`
- * path and no host before it (`/questions/88490`) yields the ID alone. A host
- * must hold two labels, so `unix/questions/1` and `./questions/1` are paths,
- * not hosts. Returns null when the text holds no `/questions/{id}`.
+ * Read the post target and the authority immediately before its path. Keep
+ * the legacy /questions/ match first for wrapped URLs and hostless paths.
  */
-function parseQuestionIdOrUrl(input: string): { questionId: number; host?: string } | null {
+function parseQuestionIdOrUrl(input: string): (ThreadTarget & { host?: string }) | null {
   const trimmed = input.trim();
   if (/^\d+$/.test(trimmed)) return { questionId: parseInt(trimmed, 10) };
 
-  const ref = QUESTION_REF.exec(trimmed);
-  if (!ref?.[1]) return null;
-  const questionId = parseInt(ref[1], 10);
+  const question = QUESTION_REF.exec(trimmed);
+  const ref = question ?? SHARE_REF.exec(trimmed);
+  if (!ref) return null;
   const authority = AUTHORITY_BEFORE.exec(trimmed.slice(0, ref.index))?.[1];
   const hostname = authority ? URL.parse(`https://${authority}`)?.hostname : undefined;
   const host = hostname === undefined ? undefined : bareHost(hostname);
   // Two non-empty labels at least, so `.` and `..` stay relative-path segments.
-  return host && /[^.]\.[^.]/.test(host) ? { questionId, host } : { questionId };
+  const location = host && /[^.]\.[^.]/.test(host) ? { host } : {};
+  if (!question) {
+    const id = Number(ref[2]);
+    return ref[1] === 'a' ? { ...location, answerId: id } : { ...location, questionId: id };
+  }
+  const questionId = Number(question[1]);
+  const answerId = Number(LONG_ANSWER_REF.exec(trimmed.slice(ref.index + ref[0].length))?.[1]);
+  return {
+    ...location,
+    questionId,
+    ...(Number.isSafeInteger(answerId) && answerId > 0 && answerId !== questionId
+      ? { answerId }
+      : {}),
+  };
 }
 
 /**
@@ -85,12 +99,6 @@ function namesSameSite(site: string, urlHost: string, link: string): boolean {
     (linkHost !== undefined && (value === linkHost || value === siteParameterOf(linkHost)))
   );
 }
-
-/**
- * Per-post comment cap the service applies. Mirrored here so the handler can
- * report it to the agent alongside the per-post `commentsTruncated` flags.
- */
-const COMMENTS_CAP = 20;
 
 /** One comment hanging off a question or an answer. */
 const commentSchema = z
@@ -121,15 +129,12 @@ type CommentedPost = {
  * one means the fetch could not establish its state.
  */
 const commentsDescription = (post: string) =>
-  `Comments on ${post}, newest first, present only when includeComments is true. An empty array means ` +
-  'this post has no comments; an absent array means its comment state is unknown — either comments were ' +
-  'not requested, or the batched fetch was cut short before this post contributed any. Never read an ' +
-  'absent array as "no comments".';
+  `Comments on ${post}, newest first. An empty array means no entries on the requested page. An absent array means comments were not requested or no entries for this post could be established from the fetched page.`;
 
 export const stackexchangeGetThread = tool('stackexchange_get_thread', {
   title: 'Get Stack Exchange Q&A Thread',
   description:
-    'Fetch a complete Q&A thread — question body and all answers, accepted answer first then sorted by score, rendered as clean markdown with fenced code blocks. Accepts a full Stack Exchange question URL, which is read from the site its host names (e.g. "https://unix.stackexchange.com/questions/88490/how-do-i-use-a-heredoc"), or an integer question ID read from site (e.g. "11227809"). HTML is normalized to markdown automatically; attribution (author + link) included per CC BY-SA 4.0. Get question IDs from stackexchange_search_questions or stackexchange_get_tag_faq.',
+    'Fetch a Stack Exchange question and a page of answers, accepted first then by score, with Markdown bodies and attribution. Accepts a question ID, a full question URL, or a Share URL like "https://stackoverflow.com/q/11227809" or "https://stackoverflow.com/a/11227902". Use answersPage to continue and includeComments to read corrections and follow-up discussion.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -139,13 +144,13 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     questionIdOrUrl: z
       .string()
       .describe(
-        'Numeric question ID (e.g. "11227809") or a full Stack Exchange question URL (e.g. "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster"). A URL carries its own site: the question is read from the URL\'s host, so question IDs from any Stack Exchange site resolve correctly. A URL whose host is not a Stack Exchange site is read from site when one is given, and fails as invalid_site otherwise.',
+        'Numeric question ID or a Stack Exchange question or answer URL (/questions/, /q/, or /a/). A URL supplies its site. If its host is unknown to Stack Exchange, the tool uses the explicit site when provided and otherwise reports invalid_site.',
       ),
     site: z
       .string()
       .optional()
       .describe(
-        'Stack Exchange site a numeric question ID belongs to — the api_site_parameter (e.g. "stackoverflow", "unix") or the site\'s domain (e.g. "unix.stackexchange.com"). Defaults to "stackoverflow". Not needed with a URL, which names its own site: a site naming a different one is ignored, or used when the URL host is not a Stack Exchange site, and either way reported as siteConflict. Call stackexchange_list_sites to discover valid values.',
+        'Stack Exchange site a numeric question ID belongs to — the apiSiteParameter (e.g. "stackoverflow", "unix") or the site\'s domain (e.g. "unix.stackexchange.com"). Defaults to "stackoverflow". Not needed with a URL, which names its own site: a site naming a different one is ignored, or used when the URL host is not a Stack Exchange site, and either way reported as siteConflict. Call stackexchange_list_sites to discover valid values.',
       ),
     maxAnswers: z
       .number()
@@ -154,19 +159,50 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       .max(100)
       .default(10)
       .describe(
-        'Maximum number of answers to include (1–100, default 10). Answers are sorted: accepted first, then by score.',
+        'Votes page size (1–100, default 10). The linked answer and the first page’s accepted answer can add items beyond this size.',
       ),
+    answersPage: z
+      .number()
+      .int()
+      .min(1)
+      .default(1)
+      .describe('Votes page to fetch, starting at 1. Keep maxAnswers fixed when paging.'),
     includeComments: z
       .boolean()
       .default(false)
       .describe(
-        'Fetch the comment thread under the question and under every returned answer (default false). ' +
-          'Comments are where a stale answer usually gets corrected ("this breaks on v3", "use X instead now"), ' +
-          "so set this when the answer's continued accuracy matters. Costs 2 extra API calls against the daily " +
-          'quota regardless of how many answers are returned.',
+        'Fetch the requested comments page on the question and on batches of up to 100 returned answer IDs. An out-of-page answer from a long URL can add a separate comments request.',
+      ),
+    commentsPage: z
+      .number()
+      .int()
+      .min(1)
+      .default(1)
+      .describe(
+        'Comment page to fetch with includeComments, starting at 1. Keep the question URL, answersPage and maxAnswers fixed when paging comments.',
       ),
   }),
   output: z.object({
+    ...closureFields,
+    duplicateOf: z
+      .array(
+        z
+          .object({
+            questionId: z.number().int().describe('Original question ID on the same site.'),
+            title: z.string().describe('Title of the original question.'),
+            answerCount: z.number().int().describe('Answer count on the original question.'),
+            acceptedAnswerId: z
+              .number()
+              .int()
+              .optional()
+              .describe('Accepted answer ID when reported.'),
+          })
+          .describe('A question identified by Stack Exchange as an original of this duplicate.'),
+      )
+      .optional()
+      .describe(
+        'Original questions for a duplicate, in Stack Exchange order. Pass their question IDs to this tool with the same site.',
+      ),
     questionId: z
       .number()
       .int()
@@ -179,8 +215,14 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       .int()
       .optional()
       .describe(
-        'Total answers the question has upstream. When greater than the returned answers[] length, more answers exist — raise maxAnswers to fetch them.',
+        'Total answers the question has upstream, across all pages. Use nextAnswersPage, when present, to continue.',
       ),
+    answersPage: z.number().int().optional().describe('Requested votes page when greater than 1.'),
+    commentsPage: z
+      .number()
+      .int()
+      .optional()
+      .describe('Requested comment page when greater than 1 and comments were requested.'),
     tags: z
       .array(z.string().describe('A tag applied to this question.'))
       .describe('Tags applied to this question.'),
@@ -215,9 +257,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     commentsTruncated: z
       .boolean()
       .optional()
-      .describe(
-        "True when the question's comments[] is a partial list — more exist upstream than were returned.",
-      ),
+      .describe("True when this slice doesn't establish the question's full comment list."),
     answers: z
       .array(
         z
@@ -260,9 +300,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
             commentsTruncated: z
               .boolean()
               .optional()
-              .describe(
-                "True when this answer's comments[] is a partial list — more exist upstream than were returned.",
-              ),
+              .describe("True when this slice doesn't establish the answer's full comment list."),
           })
           .describe(
             'A single Q&A answer with markdown body, score, dates, and author attribution.',
@@ -275,15 +313,34 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     quotaMax: z
       .number()
       .describe('Maximum API quota calls per day (300 keyless, ~10,000 with API key).'),
-    truncated: z.boolean().optional().describe('True when answers were capped at maxAnswers.'),
+    truncated: z.boolean().optional().describe('True when the votes page has a successor.'),
     shown: z.number().optional().describe('Number of answers returned.'),
     cap: z.number().optional().describe('The maxAnswers cap applied to this request.'),
     commentsCap: z
       .number()
       .optional()
       .describe(
-        'Maximum comments carried per post — a post at this count reports commentsTruncated.',
+        'Maximum number of comments per upstream page, shared across all IDs in an answer batch.',
       ),
+    nextAnswersPage: z
+      .number()
+      .int()
+      .optional()
+      .describe('Next answersPage when Stack Exchange reports more votes-ranked answers.'),
+    nextQuestionCommentsPage: z
+      .number()
+      .int()
+      .optional()
+      .describe('Next commentsPage when the question has more comments.'),
+    nextAnswerCommentsPage: z
+      .number()
+      .int()
+      .optional()
+      .describe('Next commentsPage when at least one answer batch has more comments.'),
+    notice: z
+      .string()
+      .optional()
+      .describe('How to continue the answer page or which linked content could not be read.'),
     siteConflict: z
       .object({
         resolvedBy: z
@@ -302,6 +359,18 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
   enrichmentTrailer: {
     quotaRemaining: { label: 'Quota Remaining' },
     quotaMax: { label: 'Quota Max' },
+    nextQuestionCommentsPage: {
+      render: (value) =>
+        value === undefined
+          ? ''
+          : `> More question comments are available. Continue with commentsPage: ${value}.`,
+    },
+    nextAnswerCommentsPage: {
+      render: (value) =>
+        value === undefined
+          ? ''
+          : `> More comments are available in at least one answer batch. Continue with commentsPage: ${value}, keeping answersPage and maxAnswers fixed.`,
+    },
     siteConflict: {
       render: (value) => {
         if (value === undefined) return '';
@@ -324,6 +393,21 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         'Verify the question ID or run stackexchange_search_questions to find a valid question ID.',
     },
     {
+      reason: 'answer_not_found',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'An answer Share URL refers to an answer absent from the Stack Exchange response.',
+      recovery: 'Verify the answer URL or pass its full question URL to read the thread.',
+    },
+    {
+      reason: 'paging_depth_limit',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'Stack Exchange refused a requested page above 25 without an API key.',
+      recovery:
+        'Use answersPage and commentsPage at 25 or below, or configure STACKEXCHANGE_API_KEY.',
+    },
+    {
       reason: 'invalid_site',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
@@ -335,9 +419,8 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       reason: 'invalid_id_or_url',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The input is neither an integer ID nor text holding a /questions/{id} path, or Stack Exchange refused the ID.',
-      recovery:
-        'Provide a numeric question ID (e.g. "11227809") or a valid Stack Exchange question URL.',
+      when: 'The input has no recognized question ID or post URL, or Stack Exchange refused the ID.',
+      recovery: 'Provide a numeric question ID or a valid Stack Exchange question or answer URL.',
     },
     {
       reason: 'invalid_parameter',
@@ -360,17 +443,16 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
       reason: 'throttled',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
-      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      when: 'Stack Exchange returned an IP throttle, or the backoff for this API method exceeds the remaining time.',
       recovery:
-        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+        'Wait the retryAfter seconds shown before retrying. A method backoff applies to that method across sites. HTTP 429 and throttle_violation apply to every method.',
     },
     {
       reason: 'pacer_shed',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
-      recovery:
-        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
+      recovery: 'Wait the retryAfter seconds shown before retrying the queued request.',
     },
     {
       reason: 'invalid_api_key',
@@ -399,7 +481,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         { input: input.questionIdOrUrl },
       );
     }
-    const { questionId, host } = parsed;
+    const { host, ...reference } = parsed;
 
     // A blank site from a form-based client is unset. `site` is optional rather
     // than defaulted so an omitted value is never reported as a siteConflict.
@@ -413,12 +495,23 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         : undefined;
 
     const svc = getStackExchangeService();
-    const { thread, quotaRemaining, quotaMax, siteUsed } = await svc.getThread(
+    const {
+      thread,
+      quotaRemaining,
+      quotaMax,
+      siteUsed,
+      answersHaveMore,
+      questionCommentsHaveMore,
+      answerCommentsHaveMore,
+      linkedLookupFailed,
+    } = await svc.getThread(
       {
-        questionId,
+        ...reference,
         site,
         ...(fallbackSite !== undefined ? { fallbackSite } : {}),
         maxAnswers: input.maxAnswers,
+        answersPage: input.answersPage,
+        commentsPage: input.commentsPage,
         includeComments: input.includeComments,
       },
       ctx,
@@ -440,21 +533,40 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     ctx.enrich({
       quotaRemaining,
       quotaMax,
-      ...(input.includeComments ? { commentsCap: COMMENTS_CAP } : {}),
+      ...(input.includeComments ? { commentsCap: COMMENTS_PAGE_SIZE } : {}),
+      ...(answersHaveMore ? { nextAnswersPage: input.answersPage + 1 } : {}),
+      ...(questionCommentsHaveMore ? { nextQuestionCommentsPage: input.commentsPage + 1 } : {}),
+      ...(answerCommentsHaveMore ? { nextAnswerCommentsPage: input.commentsPage + 1 } : {}),
       ...(siteConflict ? { siteConflict } : {}),
     });
-    if (thread.answers.length < thread.answerCount) {
-      ctx.enrich.truncated({ shown: thread.answers.length, cap: input.maxAnswers });
+    const linkedNotice = linkedLookupFailed
+      ? `Could not read the linked answer${linkedLookupFailed === 'comments' ? '’s comments' : ''} from Stack Exchange.`
+      : '';
+    if (answersHaveMore) {
+      const continuation = `Continue with answersPage: ${input.answersPage + 1} and keep maxAnswers at ${input.maxAnswers}.`;
+      ctx.enrich.truncated({
+        shown: thread.answers.length,
+        cap: input.maxAnswers,
+        guidance: linkedNotice ? `${continuation} ${linkedNotice}` : continuation,
+      });
+    } else if (linkedNotice) {
+      ctx.enrich.notice(linkedNotice);
     }
 
     ctx.log.info('Fetched SE thread', {
-      questionId,
+      questionId: thread.questionId,
       site: siteUsed,
       answerCount: thread.answers.length,
       includeComments: input.includeComments,
     });
 
-    return thread;
+    return {
+      ...thread,
+      ...(input.answersPage > 1 ? { answersPage: input.answersPage } : {}),
+      ...(input.includeComments && input.commentsPage > 1
+        ? { commentsPage: input.commentsPage }
+        : {}),
+    };
   },
 
   format: (result) => {
@@ -482,7 +594,11 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         return;
       }
       if (post.comments.length === 0) {
-        lines.push('  *No comments.*');
+        lines.push(
+          result.commentsPage || post.commentsTruncated
+            ? '  *No comments on this page.*'
+            : '  *No comments.*',
+        );
         lines.push('');
         return;
       }
@@ -504,7 +620,7 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
         lines.push(`  - ${parts.join(' · ')}: ${c.bodyMarkdown}`);
       }
       if (post.commentsTruncated) {
-        lines.push('  *Comment list is partial for this post — more exist upstream.*');
+        lines.push('  *Partial comment list for this post.*');
       }
       lines.push('');
     };
@@ -513,9 +629,25 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
     lines.push(`# ${escapeMarkdownInline(result.title)}`);
     const statParts = [`**Question ID:** ${result.questionId}`, `**Score:** ${result.score}`];
     if (result.answerCount != null) statParts.push(`**Answers:** ${result.answerCount}`);
+    if (result.answersPage !== undefined) statParts.push(`**Answers page:** ${result.answersPage}`);
+    if (result.commentsPage !== undefined)
+      statParts.push(`**Comments page:** ${result.commentsPage}`);
     if (result.creationDate) statParts.push(`**Asked:** ${result.creationDate}`);
     if (result.lastActivityDate) statParts.push(`**Active:** ${result.lastActivityDate}`);
+    appendClosureStats(statParts, result);
     lines.push(statParts.join(' | '));
+    if (result.duplicateOf !== undefined) {
+      lines.push(`**Duplicate of (${result.duplicateOf.length}):**`);
+      for (const original of result.duplicateOf) {
+        const accepted =
+          original.acceptedAnswerId === undefined
+            ? ''
+            : ` · accepted answer ${original.acceptedAnswerId}`;
+        lines.push(
+          `- Question ${original.questionId}: ${escapeMarkdownInline(original.title)} · answers: ${original.answerCount}${accepted}`,
+        );
+      }
+    }
     lines.push(`**Tags:** ${escapeMarkdownInline(result.tags.join(', '))}`);
     lines.push(`**Link:** ${markdownLink(result.link, result.link)}`);
     if (result.authorName) {
@@ -539,7 +671,11 @@ export const stackexchangeGetThread = tool('stackexchange_get_thread', {
 
     // Answers
     if (result.answers.length === 0) {
-      lines.push('*No answers yet.*');
+      lines.push(
+        result.answersPage === undefined
+          ? '*No answers yet.*'
+          : `*No answers on page ${result.answersPage}.*`,
+      );
     } else {
       lines.push(`---\n\n## Answers (${result.answers.length})`);
       for (const a of result.answers) {

@@ -36,10 +36,10 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 | Tool | Description |
 |:---|:---|
 | `stackexchange_search_questions` | Search questions across a Stack Exchange site with full-text query, tag filters, score threshold, and sort order |
-| `stackexchange_get_thread` | Fetch a question and its answers as markdown, with a configurable answer limit and the accepted answer first |
+| `stackexchange_get_thread` | Read a question or answer link, follow duplicate targets, and page through answers and comments |
 | `stackexchange_get_tag_faq` | Fetch a tag's frequently asked questions — Stack Exchange's own selection, in its order rather than by score |
 | `stackexchange_get_user` | Fetch a user profile by ID: reputation, badge counts, top tags by answer score, and account metadata |
-| `stackexchange_list_sites` | Enumerate all Stack Exchange network sites and their `api_site_parameter` values |
+| `stackexchange_list_sites` | Find a community by name, site parameter, or audience. Add `meta` to include meta sites |
 
 ### Agent skill
 
@@ -53,7 +53,7 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 
 - Full-text query with optional tag filters, minimum score threshold, and accepted-only filter; sort by relevance (default), votes, activity, or newest
 - Up to 30 results per page (default 10); `page` for more — each page costs one API quota unit, and paging past 25 requires `STACKEXCHANGE_API_KEY`
-- Returns question ID, title, score, answer count, tags, and a ~300-character excerpt — IDs flow directly into `stackexchange_get_thread`
+- Returns question IDs, scores, answer counts, tags and short excerpts. Closed questions also carry the reported reason and date. A blank query browses the site with any supplied tags or other filters.
 - Quota remaining and max surfaced via enrichment on every response
 - Every response reports `appliedSort`, the order Stack Exchange actually used; `minScore` forces `votes`, and `sortOverrideReason` says so whenever that replaces the requested `sort`
 
@@ -61,12 +61,12 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 
 ### `stackexchange_get_thread` <sub>tool</sub>
 
-- Accepts a numeric question ID or a full Stack Exchange question URL; fetches the question and a page of `maxAnswers` answers (1–100, default 10), adding the accepted answer if it falls outside that page
+- Accepts a numeric question ID, a `/questions/` URL, or a `/q/` or `/a/` Share link. `answersPage` selects a vote-ranked page of `maxAnswers` answers (1–100, default 10). Page 1 also includes the accepted answer when available. Answer links include their target when available.
 - A URL is read from the site its host names (`unix.stackexchange.com`, `ru.stackoverflow.com`, `arqade.com`, …), so `site` applies only to a numeric ID or a hostless `/questions/` path; a `site` naming a different site than the URL is ignored, and a URL whose host is not a Stack Exchange site (a translation proxy) is read from `site` instead — either way reported as `siteConflict` on both surfaces. Such a URL sent without `site` fails as `invalid_site`
 - HTML→markdown normalization built in — code blocks, links, lists, headers, and blockquotes all converted
-- Optional `includeComments` fetches up to 20 comments per post, newest first, using two extra API calls (one when there are no answers); `commentsTruncated` reports partial lists
+- Set `includeComments` to read comments, newest first. Follow `commentsPage` with the same answer page and page size to continue. Each comment route or batch returns up to 100 comments per page.
 - Attribution (author name, profile link, score) on every answer per CC BY-SA 4.0
-- Quota remaining and max surfaced via enrichment; `truncated` when more answers exist upstream than `maxAnswers` returned
+- A duplicate question can carry `duplicateOf` entries with the original question IDs, titles, answer counts and any accepted answer IDs. Pass an original ID back with the same `site`.
 
 ---
 
@@ -74,7 +74,7 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 
 - A tag's frequently asked questions — maps to `/tags/{tag}/faq`, Stack Exchange's own selection, returned in its order and not sorted by score
 - Up to 30 results per page (default 10); `page` for more — each page costs one API quota unit, and paging past 25 requires `STACKEXCHANGE_API_KEY`
-- Returns a question list without bodies; pipe any `questionId` into `stackexchange_get_thread` for full content
+- Returns question IDs and closure details when available. Pass a `questionId` to `stackexchange_get_thread` for the body and answers. A blank tag returns `invalid_tag`.
 - Quota remaining and max surfaced via enrichment on every response
 
 ---
@@ -91,8 +91,8 @@ Stack Overflow and the rest of the Stack Exchange network, from Super User and S
 ### `stackexchange_list_sites` <sub>tool</sub>
 
 - Fetches every site in the Stack Exchange network, walking pages of 100 up to a 10-page cap; an enrichment notice flags a partial list if the network still has more
-- Optional case-insensitive name filter matches against site name and `api_site_parameter`, applied client-side after the fetch
-- Returns the `api_site_parameter` value (e.g. `stackoverflow`, `superuser`, `serverfault`) that every other tool's `site` parameter accepts; the site's domain (e.g. `serverfault.com`) works there too
+- Filter tokens match across name, `apiSiteParameter`, and audience. A standalone `meta` token includes meta sites alongside matching main sites. With `meta` alone, the response includes every fetched site.
+- Returns the `apiSiteParameter` value (e.g. `stackoverflow`, `superuser`, `serverfault`) that every other tool's `site` parameter accepts; the site's domain (e.g. `serverfault.com`) works there too
 
 ---
 
@@ -103,15 +103,15 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Stack Exchange-specific:
 
 - HTML→markdown conversion preserves code blocks, tables, links, images, and nested lists
-- Shared upstream queue honors response backoff, stated throttle waits, and HTTP 429 cooldowns; each operation has a 50-second budget covering queue time, backoff, requests, and retries, a backoff that cannot fit it fails at once, and a queued call sheds before the budget ends, both with `retryAfter` instead of running out the clock
+- The shared queue dispatches one upstream request at a time. Successful-response backoffs hold the same API method across sites and arguments. HTTP 429 and `throttle_violation` hold all methods. Each operation has a 50-second budget and reports `retryAfter` when a wait cannot fit.
 - Quota logging: `quota_remaining` and `quota_max` surfaced via enrichment on every tool call
-- Typed error contracts on every tool — `invalid_site`, `invalid_parameter`, `invalid_api_key`, `invalid_id_or_url`, `invalid_user_id`, `question_not_found`, `user_not_found`, `paging_depth_limit`, `quota_exceeded`, `throttled`, `pacer_shed`, and `upstream_unavailable`
+- Typed error contracts include `invalid_tag`, `invalid_site`, `invalid_parameter`, `invalid_api_key`, `invalid_id_or_url`, `invalid_user_id`, `question_not_found`, `answer_not_found`, `user_not_found`, `paging_depth_limit`, `quota_exceeded`, `throttled`, `pacer_shed`, and `upstream_unavailable`.
 - Optional `STACKEXCHANGE_API_KEY` lifts the per-IP quota from ~300/day to ~10,000/day with no OAuth required
 
 Agent-friendly output:
 
 - Quota remaining on every response — agents can plan around rate limits without the server needing to fail
-- The accepted answer appears first, followed by the remaining answers sorted by score
+- When present on an answer page, the accepted answer appears first. The remaining answers follow by score.
 - Each answer includes attribution under CC BY-SA 4.0
 - Typed `not_found` errors for missing questions and users (SE returns HTTP 200 with empty `items[]` rather than 404)
 
@@ -159,7 +159,7 @@ Without a key, the Stack Exchange API allows ~300 requests/day per IP; set `STAC
 | `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. `auto` resolves to stateful. A meaningful env value overrides this server's stateless source default; blank or unsubstituted placeholders use the source default. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
-| `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
+| `LOGS_DIR` | Directory for log files (Node.js only). | `<server-package-root>/logs` |
 | `LOG_TOOL_FAILURE_PAYLOADS` | Log each failed tool call's arguments and result, redacted by key name and capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (default `16384`). A secret inside a free-form value is not redacted. | `false` |
 | `STORAGE_PROVIDER_TYPE` | Storage backend. | `in-memory` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry) (spans, metrics, completion logs). | `false` |
@@ -173,7 +173,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 
 - **Clone and install:**
 

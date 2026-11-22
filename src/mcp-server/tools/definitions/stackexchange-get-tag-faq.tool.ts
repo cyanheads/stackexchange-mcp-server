@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
+import { appendClosureStats, closureFields } from '../question-closure.js';
 
 export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
   title: 'Get Stack Exchange Tag FAQ',
@@ -20,12 +21,14 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
   input: z.object({
     tag: z
       .string()
-      .describe('Tag to look up (e.g. "python", "javascript", "docker"). Must match exactly.'),
+      .describe(
+        'Tag to look up (e.g. "python", "javascript", "docker"). Must match exactly after trimming surrounding whitespace.',
+      ),
     site: z
       .string()
       .default('stackoverflow')
       .describe(
-        'Stack Exchange site — the api_site_parameter (e.g. "stackoverflow", "superuser") or the site\'s domain (e.g. "superuser.com"). Defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
+        'Stack Exchange site — the apiSiteParameter (e.g. "stackoverflow", "superuser") or the site\'s domain (e.g. "superuser.com"). Blank or omitted defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
       ),
     pageSize: z
       .number()
@@ -50,6 +53,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       .array(
         z
           .object({
+            ...closureFields,
             questionId: z
               .number()
               .int()
@@ -117,12 +121,19 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
 
   errors: [
     {
+      reason: 'invalid_tag',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The supplied tag is empty or contains only whitespace.',
+      recovery:
+        'Pass a tag name such as "python", or use stackexchange_search_questions to browse.',
+    },
+    {
       reason: 'invalid_site',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
-        'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',
+        'Call stackexchange_list_sites to discover valid site apiSiteParameter values and retry.',
     },
     {
       reason: 'invalid_parameter',
@@ -145,17 +156,16 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       reason: 'throttled',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
-      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      when: 'Stack Exchange returned an IP throttle, or the backoff for this API method exceeds the remaining time.',
       recovery:
-        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+        'Wait the retryAfter seconds shown before retrying. A method backoff applies to that method across sites. HTTP 429 and throttle_violation apply to every method.',
     },
     {
       reason: 'pacer_shed',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
-      recovery:
-        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
+      recovery: 'Wait the retryAfter seconds shown before retrying the queued request.',
     },
     {
       reason: 'paging_depth_limit',
@@ -184,11 +194,15 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
   ],
 
   async handler(input, ctx) {
+    const tag = input.tag.trim();
+    if (!tag) throw ctx.fail('invalid_tag', 'A tag name is required.');
+
+    const site = input.site.trim() || 'stackoverflow';
     const svc = getStackExchangeService();
     const { questions, quotaRemaining, quotaMax, hasMore } = await svc.getTagFaq(
       {
-        tag: input.tag,
-        site: input.site,
+        tag,
+        site,
         pageSize: input.pageSize,
         page: input.page,
       },
@@ -211,22 +225,22 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
     } else if (questions.length === 0) {
       ctx.enrich.notice(
         input.page > 1
-          ? `Page ${input.page} is past the end of the FAQ for tag "${input.tag}" on ${input.site}. Request a lower page.`
-          : `No FAQ questions found for tag "${input.tag}" on ${input.site}. Verify the tag name or try a different site.`,
+          ? `Page ${input.page} is past the end of the FAQ for tag "${tag}" on ${site}. Request a lower page.`
+          : `No FAQ questions found for tag "${tag}" on ${site}. Verify the tag name or try a different site.`,
       );
     }
 
     ctx.log.info('Fetched SE tag FAQ', {
-      tag: input.tag,
-      site: input.site,
+      tag,
+      site,
       page: input.page,
       count: questions.length,
     });
 
     return {
       questions,
-      tag: input.tag,
-      site: input.site,
+      tag,
+      site,
       page: input.page,
       attribution:
         'Stack Exchange Network — content licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)',
@@ -253,6 +267,7 @@ export const stackexchangeGetTagFaq = tool('stackexchange_get_tag_faq', {
       ];
       if (q.creationDate) stats.push(`**Asked:** ${q.creationDate}`);
       if (q.lastActivityDate) stats.push(`**Active:** ${q.lastActivityDate}`);
+      appendClosureStats(stats, q);
       lines.push(stats.join(' | '));
       lines.push(`**Tags:** ${escapeMarkdownInline(q.tags.join(', '))}`);
       lines.push(`**Link:** ${markdownLink(q.link, q.link)}`);

@@ -11,22 +11,21 @@ import { getStackExchangeService } from '@/services/stackexchange/stackexchange-
 export const stackexchangeListSites = tool('stackexchange_list_sites', {
   title: 'List Stack Exchange Sites',
   description:
-    'Enumerate all sites in the Stack Exchange network — name, api_site_parameter, audience, and URL. ' +
-    'The api_site_parameter value is what other tools accept as the `site` input (e.g. "stackoverflow", "superuser", "serverfault"). ' +
-    'Results are fetched live and optionally filtered by name. ' +
+    'Discover Stack Exchange communities by name, apiSiteParameter, or audience. Returns site type and URL. ' +
+    'The apiSiteParameter value is what other tools accept as the `site` input (e.g. "stackoverflow", "superuser", "serverfault"). ' +
+    'Results are fetched live. Include the standalone "meta" filter token to include meta sites. ' +
     'Use this tool to discover valid site parameters before calling other stackexchange_* tools.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
-    openWorldHint: false,
+    openWorldHint: true,
   },
   input: z.object({
     filter: z
       .string()
       .optional()
       .describe(
-        'Optional case-insensitive name filter — returns only sites whose name contains all provided tokens. ' +
-          'Omit to return all sites.',
+        'Case-insensitive filter. Every token must match the site name, apiSiteParameter, or audience. Include the standalone token "meta" to include meta sites, or pass "meta" alone to browse the complete catalog.',
       ),
   }),
   output: z.object({
@@ -41,6 +40,10 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
                 'Value to pass as the `site` parameter on all other stackexchange_* tools (e.g. "stackoverflow").',
               ),
             siteUrl: z.string().describe('Public URL of the site.'),
+            siteType: z
+              .string()
+              .optional()
+              .describe('Upstream site type when known (e.g. "main_site" or "meta_site").'),
             audience: z
               .string()
               .optional()
@@ -48,7 +51,7 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
           })
           .describe('A Stack Exchange network site entry.'),
       )
-      .describe('Stack Exchange network sites matching the optional name filter.'),
+      .describe('Stack Exchange sites matching the filter and meta-site selection.'),
     totalCount: z.number().describe('Total number of sites returned after filtering.'),
   }),
   enrichment: {
@@ -81,17 +84,16 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
       reason: 'throttled',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
-      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      when: 'Stack Exchange returned an IP throttle, or the backoff for this API method exceeds the remaining time.',
       recovery:
-        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+        'Wait the retryAfter seconds shown before retrying. A method backoff applies to that method across sites. HTTP 429 and throttle_violation apply to every method.',
     },
     {
       reason: 'pacer_shed',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
-      recovery:
-        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
+      recovery: 'Wait the retryAfter seconds shown before retrying the queued request.',
     },
     {
       reason: 'invalid_parameter',
@@ -125,35 +127,45 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
 
     ctx.enrich({ quotaRemaining, quotaMax });
 
-    // A whitespace-only filter selects nothing to narrow by, so it must not
-    // narrow, must not report a no-match, and must not log as applied.
-    const filterQuery = input.filter?.trim();
-
-    let filtered = sites;
-    if (filterQuery) {
-      const normalize = (s: string) =>
-        s
-          .toLowerCase()
-          .normalize('NFKD')
-          .replace(/[̀-ͯ]/g, '')
-          .replace(/[^a-z0-9\s]/g, ' ');
-      const tokens = normalize(filterQuery).split(/\s+/).filter(Boolean);
-      filtered = sites.filter((s) => {
-        const hay = `${normalize(s.name)} ${normalize(s.apiSiteParameter)}`;
-        return tokens.every((t) => hay.includes(t));
-      });
-    }
+    const normalize = (s: string) =>
+      s
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(/[̀-ͯ]/g, '')
+        .replace(/[^a-z0-9\s]/g, ' ');
+    const tokens = normalize(input.filter ?? '')
+      .split(/\s+/)
+      .filter(Boolean);
+    const includeMeta = tokens.includes('meta');
+    const terms = tokens.filter((token) => token !== 'meta');
+    const matching = terms.length
+      ? sites.filter((site) => {
+          const searchable = normalize(
+            `${site.name} ${site.apiSiteParameter} ${site.audience ?? ''}`,
+          );
+          return terms.every((term) => searchable.includes(term));
+        })
+      : sites;
+    const filtered = includeMeta
+      ? matching
+      : matching.filter((site) => site.siteType !== 'meta_site');
+    const omittedMeta = matching.length - filtered.length;
 
     const notices: string[] = [];
-    if (filterQuery && filtered.length === 0) {
+    if (terms.length > 0 && matching.length === 0) {
       notices.push(
-        `No site matched "${input.filter}". Call stackexchange_list_sites without a filter to browse all sites.`,
+        `No site matched "${input.filter}". Omit the filter to browse communities or use "meta" alone for the complete catalog.`,
+      );
+    }
+    if (omittedMeta > 0) {
+      notices.push(
+        `Omitted ${omittedMeta} matching meta site${omittedMeta === 1 ? '' : 's'}. Include the "meta" token to see them.`,
       );
     }
     if (truncated) {
       notices.push(
         'This site list is partial — Stack Exchange still reported more sites when the page walk reached its limit. ' +
-          'A site absent from these results may still exist; pass its api_site_parameter directly to another stackexchange_* tool to check.',
+          'A site absent from these results may still exist; pass its apiSiteParameter directly to another stackexchange_* tool to check.',
       );
     }
     if (notices.length > 0) {
@@ -162,7 +174,7 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
 
     ctx.log.info('Listed SE sites', {
       total: filtered.length,
-      filtered: Boolean(filterQuery),
+      filtered: terms.length > 0,
       truncated,
     });
     return { sites: filtered, totalCount: filtered.length };
@@ -180,6 +192,8 @@ export const stackexchangeListSites = tool('stackexchange_list_sites', {
       lines.push(`**api_site_parameter:** ${escapeMarkdownInline(s.apiSiteParameter)}`);
       lines.push(`**URL:** ${markdownLink(s.siteUrl, s.siteUrl)}`);
       if (s.audience) lines.push(`**Audience:** ${escapeMarkdownInline(s.audience)}`);
+      if (s.siteType !== undefined)
+        lines.push(`**Site type:** ${escapeMarkdownInline(s.siteType)}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];

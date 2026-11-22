@@ -32,6 +32,16 @@ export interface SeQuestion {
    * custom filter that names it — the search route's SE_SEARCH_FILTER does.
    */
   body_markdown?: string;
+  closed_date?: number;
+  closed_details?: {
+    original_questions?: {
+      question_id: number;
+      title: string;
+      answer_count: number;
+      accepted_answer_id?: number;
+    }[];
+  };
+  closed_reason?: string;
   creation_date?: number;
   /** Excerpt from search results (search endpoint only). */
   excerpt?: string;

@@ -21,7 +21,8 @@ import type {
 // ---------------------------------------------------------------------------
 // Service mock
 // ---------------------------------------------------------------------------
-vi.mock('@/services/stackexchange/stackexchange-service.js', () => ({
+vi.mock(import('@/services/stackexchange/stackexchange-service.js'), async (original) => ({
+  ...(await original()),
   getStackExchangeService: vi.fn(),
 }));
 
@@ -88,9 +89,12 @@ const makeComment = (overrides: FixtureOverrides<NormalizedComment> = {}): Norma
   });
 
 /** A service stand-in that reads every thread from the site it was asked for. */
-const makeThreadResult = (thread = makeThread()) => ({
+const makeThreadResult = (thread = makeThread(), answersHaveMore = false) => ({
   getThread: vi.fn(async (opts: { site: string }) => ({
     thread,
+    answersHaveMore,
+    questionCommentsHaveMore: false,
+    answerCommentsHaveMore: false,
     quotaRemaining: 250,
     quotaMax: 300,
     siteUsed: opts.site,
@@ -383,9 +387,9 @@ describe('stackexchangeGetThread format', () => {
 // truncated enrichment gating (#7) + answerCount surfacing (#11)
 // ---------------------------------------------------------------------------
 describe('stackexchangeGetThread truncation enrichment', () => {
-  it('fires truncated when fewer answers are shown than the total answerCount', async () => {
+  it('fires truncated when the upstream votes page has a successor', async () => {
     const thread = makeThread({ answerCount: 27, answers: [makeAnswer()] });
-    mockService(makeThreadResult(thread));
+    mockService(makeThreadResult(thread, true));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
     const input = stackexchangeGetThread.input.parse({
@@ -396,8 +400,8 @@ describe('stackexchangeGetThread truncation enrichment', () => {
     expect(truncatedSpy).toHaveBeenCalledOnce();
   });
 
-  it('omits truncated when every answer is shown (answers.length === answerCount)', async () => {
-    const thread = makeThread({ answerCount: 1, answers: [makeAnswer()] });
+  it('omits truncated on the terminal page even when it has fewer answers than the thread', async () => {
+    const thread = makeThread({ answerCount: 27, answers: [makeAnswer()] });
     mockService(makeThreadResult(thread));
     const ctx = createMockContext({ errors: stackexchangeGetThread.errors });
     const truncatedSpy = vi.spyOn(ctx.enrich, 'truncated');
@@ -539,7 +543,7 @@ describe('stackexchangeGetThread comment opt-in', () => {
     );
   });
 
-  it('enriches with the per-post comment cap only when comments were requested', async () => {
+  it('enriches with the upstream comment page size only when comments were requested', async () => {
     const withComments = makeThread({
       comments: [makeComment()],
       answers: [makeAnswer({ comments: [] })],
@@ -556,7 +560,7 @@ describe('stackexchangeGetThread comment opt-in', () => {
       ctx,
     );
 
-    expect(enrichSpy).toHaveBeenCalledWith(expect.objectContaining({ commentsCap: 20 }));
+    expect(enrichSpy).toHaveBeenCalledWith(expect.objectContaining({ commentsCap: 100 }));
   });
 
   it('omits the comment cap enrichment on the default path', async () => {

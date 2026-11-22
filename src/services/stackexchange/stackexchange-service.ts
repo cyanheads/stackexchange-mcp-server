@@ -4,13 +4,11 @@
  * @module services/stackexchange/stackexchange-service
  */
 
-import { setTimeout as sleep } from 'node:timers/promises';
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   configurationError,
   forbidden,
-  JsonRpcErrorCode,
   McpError,
   notFound,
   rateLimited,
@@ -18,13 +16,14 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import {
-  createPacer,
-  fetchWithTimeout,
-  type RetryAttempt,
-  withRetry,
-} from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, type RetryAttempt, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { decodeHtmlEntities, normalizeHtml } from './html-normalizer.js';
+import {
+  type SeAttempt,
+  StackExchangePacer,
+  stackExchangeMethod,
+  throttled,
+} from './stackexchange-pacer.js';
 import type {
   SeAnswer,
   SeComment,
@@ -38,6 +37,8 @@ import type {
 
 const BASE_URL = 'https://api.stackexchange.com/2.3';
 const REQUEST_TIMEOUT_MS = 30_000;
+/** Limit optional long-link enrichment so a stalled body cannot monopolize dispatch. */
+const LINKED_LOOKUP_BUDGET_MS = 2_000;
 /** Leave headroom within a typical 60-second client timeout, including queue and backoff. */
 const OPERATION_DEADLINE_MS = 50_000;
 /**
@@ -87,14 +88,17 @@ const SE_USER_FILTER = '!fgp_FAe)vSKeMW4GBo(u*a)doNjyqH*B';
  *   wrapper:  .backoff .error_id .error_message .error_name .has_more .items
  *             .quota_max .quota_remaining
  *   question: question_id title link score answer_count is_answered tags
- *             creation_date last_activity_date body_markdown
+ *             creation_date last_activity_date body_markdown closed_reason closed_date
  *
  * Regenerate by re-requesting /filters/create with `base=none` and that
  * `include` list, then confirm the response's `included_fields` echoes every
  * one back — a field name SE does not recognize is dropped silently, so a call
  * that merely succeeds proves nothing.
  */
-const SE_SEARCH_FILTER = '!-tSBS8YTedGMoaqycoVR';
+const SE_SEARCH_FILTER = '!nHklukguOOJ2_O1n7UclKs';
+
+/** Extends withbody with closed_details.original_questions and its nested original_question fields. */
+const SE_THREAD_FILTER = '!2vHqlW)1idY*y*4O4HFN67yFvg7vfdDXn)ZlC0*rKy';
 
 /** Longest excerpt carried on a search result, in characters. */
 const EXCERPT_MAX_CHARS = 300;
@@ -108,13 +112,12 @@ const EXCERPT_MAX_CHARS = 300;
  * the whole page and starves a later one; it cannot rule it out, which is why
  * the caller still has to tell "no comments" apart from "none in this page".
  */
-const COMMENTS_PAGE_SIZE = 100;
+export const COMMENTS_PAGE_SIZE = 100;
 
 /**
- * Longest comment list carried on any one post. The combined page is shared
- * across posts, so this is applied client-side per post after grouping.
+ * Maximum IDs Stack Exchange accepts on a semicolon-delimited route.
  */
-const MAX_COMMENTS_PER_POST = 20;
+const MAX_IDS_PER_REQUEST = 100;
 
 /** A paired fenced code block, fences included. */
 const FENCED_CODE_BLOCK = /```[\s\S]*?```/g;
@@ -286,14 +289,22 @@ const invalidParameter: BadParameterMapping = (field) => ({
 
 /**
  * Mapping for the `/questions/{ids}` routes, where SE's `ids` field is the
- * question ID the caller supplied. Correct only there — every other route
- * builds `ids` from something the caller never sent.
+ * question ID the caller supplied.
  */
 const questionIdOrParameter: BadParameterMapping = (field) =>
   field === 'ids'
     ? {
         reason: 'invalid_id_or_url',
         message: 'The question ID is not a valid Stack Exchange question ID.',
+      }
+    : invalidParameter(field);
+
+/** Short answer URLs supply their own ID, unlike an accepted-answer lookup. */
+const answerIdOrParameter: BadParameterMapping = (field) =>
+  field === 'ids'
+    ? {
+        reason: 'invalid_id_or_url',
+        message: 'The answer ID is not a valid Stack Exchange answer ID.',
       }
     : invalidParameter(field);
 
@@ -329,35 +340,6 @@ function retryAfterSeconds(header: unknown): number | undefined {
 }
 
 /**
- * Stack Exchange is throttling this server's IP: a `throttle_violation`
- * envelope, an HTTP 429, or a backoff window longer than the call can wait.
- * The wait rides `retryAfter` (whole seconds, at least 1) and the message, so
- * format()-only clients see it too. An unknown wait is left off here and filled
- * by `fetchSe` from the pacer's cooldown gate.
- */
-function throttled(
-  retryAfter: number | undefined,
-  data: Record<string, unknown> = {},
-  cause?: unknown,
-): McpError {
-  const seconds = retryAfter === undefined ? undefined : Math.max(1, retryAfter);
-  return rateLimited(
-    seconds === undefined
-      ? 'Stack Exchange is throttling requests from this server.'
-      : `Stack Exchange is throttling requests from this server; retry in ${seconds} seconds.`,
-    { ...data, reason: 'throttled', ...(seconds !== undefined && { retryAfter: seconds }) },
-    cause === undefined ? undefined : { cause },
-  );
-}
-
-/** One `withRetry` attempt as `fetchSe` needs it. */
-interface SeAttempt {
-  /** The instant every wait in the attempt — queue, backoff — must end by. */
-  readonly deadlineAt: number;
-  readonly signal: AbortSignal;
-}
-
-/**
  * Hold the attempt's remaining budget as an absolute instant, so every chained
  * request in it draws on one deadline rather than restarting a duration.
  */
@@ -379,7 +361,12 @@ export interface SearchQuestionsOptions {
   tags?: string[];
 }
 
-export interface GetThreadOptions {
+/** A question reference can carry an answer hint. A short answer URL has no question ID yet. */
+export type ThreadTarget =
+  | { questionId: number; answerId?: number }
+  | { questionId?: never; answerId: number };
+
+export type GetThreadOptions = ThreadTarget & {
   apiKey?: string;
   /**
    * Site to read from instead when Stack Exchange answers `site` with "No site
@@ -387,11 +374,12 @@ export interface GetThreadOptions {
    * attempts read from it directly.
    */
   fallbackSite?: string;
+  answersPage?: number;
+  commentsPage?: number;
   includeComments?: boolean;
   maxAnswers?: number;
-  questionId: number;
   site: string;
-}
+};
 
 export interface GetUserOptions {
   apiKey?: string;
@@ -415,6 +403,8 @@ export interface GetSitesOptions {
 /** Normalized question for tool output. */
 export interface NormalizedQuestion {
   answerCount: number;
+  closedDate?: string;
+  closedReason?: string;
   /** ISO 8601 timestamp of when the question was asked. */
   creationDate?: string;
   excerpt?: string;
@@ -470,7 +460,9 @@ export interface NormalizedAnswer extends CommentState {
 }
 
 /** Normalized thread for tool output. */
-export interface NormalizedThread extends CommentState {
+export interface NormalizedThread
+  extends CommentState,
+    Pick<NormalizedQuestion, 'closedDate' | 'closedReason'> {
   acceptedAnswerId?: number;
   answerCount: number;
   answers: NormalizedAnswer[];
@@ -480,6 +472,12 @@ export interface NormalizedThread extends CommentState {
   bodyMarkdown: string;
   /** ISO 8601 timestamp of when the question was asked. */
   creationDate?: string;
+  duplicateOf?: {
+    questionId: number;
+    title: string;
+    answerCount: number;
+    acceptedAnswerId?: number;
+  }[];
   /** ISO 8601 timestamp of the question's most recent activity. */
   lastActivityDate?: string;
   link: string;
@@ -512,7 +510,16 @@ export interface NormalizedSite {
   apiSiteParameter: string;
   audience?: string;
   name: string;
+  siteType?: string;
   siteUrl: string;
+}
+
+/** The API can omit either closure field independently. */
+function questionClosure(q: SeQuestion): Pick<NormalizedQuestion, 'closedReason' | 'closedDate'> {
+  return {
+    ...(q.closed_reason !== undefined && { closedReason: decodeHtmlEntities(q.closed_reason) }),
+    ...(q.closed_date !== undefined && { closedDate: toIsoDate(q.closed_date) }),
+  };
 }
 
 /**
@@ -536,6 +543,7 @@ function normalizeQuestion(q: SeQuestion): NormalizedQuestion {
     score: q.score,
     answerCount: q.answer_count,
     isAnswered: q.is_answered,
+    ...questionClosure(q),
     tags: q.tags,
     ...(excerpt !== undefined ? { excerpt } : {}),
     ...(q.creation_date !== undefined ? { creationDate: toIsoDate(q.creation_date) } : {}),
@@ -565,31 +573,21 @@ function normalizeComment(c: SeComment): NormalizedComment {
 }
 
 /**
- * Reduce one post's share of a comment page to its capped, normalized list.
+ * Normalize one post's share of a comment page.
  *
- * `pageHasMore` is the fetch's own `has_more`. SE orders a page newest-first
- * across every post it covers rather than grouping by post, so once the page is
- * cut short no post in it can be shown to be complete — hence a post that did
- * receive comments is still reported truncated.
+ * SE orders each page newest-first across all included posts. The slice can
+ * establish a post's complete comment list only on page one with no next page.
  */
-function takeComments(items: SeComment[], pageHasMore: boolean): CommentState {
-  const truncated = items.length > MAX_COMMENTS_PER_POST || pageHasMore;
+function takeComments(items: SeComment[], partial: boolean): CommentState {
   return {
-    comments: items.slice(0, MAX_COMMENTS_PER_POST).map(normalizeComment),
-    ...(truncated ? { commentsTruncated: true } : {}),
+    comments: items.map(normalizeComment),
+    ...(partial ? { commentsTruncated: true } : {}),
   };
 }
 
 export class StackExchangeService {
   private readonly apiKey: string | undefined;
-  private backoffUntil = 0;
-  /** Re-checks for calls waiting in the queue, run whenever the backoff window grows. */
-  private readonly backoffListeners = new Set<() => void>();
-  private readonly pacer = createPacer({
-    name: 'stackexchange',
-    maxConcurrent: 1,
-    cooldown: { baseMs: 1000, maxMs: 30_000 },
-  });
+  private readonly pacer = new StackExchangePacer();
 
   constructor(_config: AppConfig, _storage: StorageService, apiKey?: string) {
     this.apiKey = apiKey;
@@ -619,94 +617,23 @@ export class StackExchangeService {
     return url.toString();
   }
 
-  /**
-   * Fetch, decompress (auto), parse, handle errors. `badParameter` maps a
-   * non-site `bad_parameter` rejection onto the calling tool's own contract.
-   *
-   * Every wait is held to `attempt.deadlineAt`. A backoff window that outlasts
-   * it fails `throttled` at once instead of being slept, and the queue wait is
-   * the pacer's `maxWaitMs`, so a queued call sheds with `pacer_shed`. Waits
-   * that fit are still taken.
-   */
-  private async fetchSe<T>(
+  /** Fetch through the method backoff and shared dispatch slot. */
+  private fetchSe<T>(
     url: string,
     ctx: Context,
     attempt: SeAttempt,
     badParameter: BadParameterMapping = invalidParameter,
   ): Promise<SeWrapper<T>> {
-    this.assertBackoffFits(attempt.deadlineAt);
-    /**
-     * A backoff that lands while this call waits in the queue, and outlasts its
-     * deadline, takes it out of the queue at once. Only the queue wait listens:
-     * the task runs on the attempt's own signal, so the slot holder whose
-     * response set the window is unaffected.
-     */
-    const refusal = new AbortController();
-    const onBackoff = () => {
-      try {
-        this.assertBackoffFits(attempt.deadlineAt);
-      } catch (error) {
-        refusal.abort(error);
-      }
-    };
-    this.backoffListeners.add(onBackoff);
-    try {
-      return await this.pacer.run(
-        async () => {
-          const waitMs = this.backoffUntil - Date.now();
-          if (waitMs > 0) await sleep(waitMs, undefined, { signal: attempt.signal });
-          return await this.fetchEnvelope<T>(url, ctx, attempt.signal, badParameter);
-        },
-        {
-          signal: AbortSignal.any([attempt.signal, refusal.signal]),
-          maxWaitMs: Math.max(0, attempt.deadlineAt - Date.now()),
-        },
-      );
-    } catch (error) {
-      throw this.withStatedWait(error);
-    } finally {
-      this.backoffListeners.delete(onBackoff);
-    }
-  }
-
-  /** Refuse, as `throttled`, a backoff window that outlasts the attempt's deadline. */
-  private assertBackoffFits(deadlineAt: number): void {
-    const now = Date.now();
-    if (this.backoffUntil <= Math.max(deadlineAt, now)) return;
-    throw throttled(Math.ceil((this.backoffUntil - now) / 1000));
-  }
-
-  /** Hold every later request until `seconds` from now, and re-check queued calls. */
-  private extendBackoff(seconds: number): void {
-    const until = Date.now() + seconds * 1000;
-    if (until <= this.backoffUntil) return;
-    this.backoffUntil = until;
-    for (const listener of this.backoffListeners) listener();
-  }
-
-  /**
-   * Name the wait on a throttle or a queue shed in its message, which is all a
-   * format()-only client reads. A throttle that stated no wait takes the
-   * cooldown gate, which the pacer has closed by the time the task's rejection
-   * arrives here. Anything else — a caller abort included — passes untouched.
-   */
-  private withStatedWait(error: unknown): unknown {
-    if (!(error instanceof McpError) || error.code !== JsonRpcErrorCode.RateLimited) return error;
-    const data = error.data ?? {};
-    if (data.reason === 'throttled' && data.retryAfter === undefined) {
-      return throttled(Math.ceil(this.pacer.cooldown.remainingMs / 1000), data, error.cause);
-    }
-    if (data.reason === 'pacer_shed') {
-      return rateLimited(`${error.message} Retry in ${String(data.retryAfter)} seconds.`, data, {
-        cause: error,
-      });
-    }
-    return error;
+    const method = stackExchangeMethod(url);
+    return this.pacer.run(method, attempt, () =>
+      this.fetchEnvelope<T>(url, method, ctx, attempt.signal, badParameter),
+    );
   }
 
   /** Hold the pacer slot until the body has updated the shared backoff window. */
   private async fetchEnvelope<T>(
     url: string,
+    method: string,
     ctx: Context,
     signal: AbortSignal,
     badParameter: BadParameterMapping,
@@ -725,7 +652,7 @@ export class StackExchangeService {
       // A bare 429. A wait it names in Retry-After holds every later request.
       if (error instanceof McpError && error.data?.status === 429) {
         const seconds = retryAfterSeconds(error.data.retryAfter);
-        if (seconds !== undefined) this.extendBackoff(seconds);
+        if (seconds !== undefined) this.pacer.extendBackoff(seconds);
         throw throttled(seconds, { status: 429 }, error);
       }
       // SE returns HTTP 400 with a JSON error envelope for every method error.
@@ -747,7 +674,7 @@ export class StackExchangeService {
           const stated = THROTTLE_WAIT_SECONDS.exec(errObj.error_message)?.[1];
           const seconds =
             stated === undefined ? retryAfterSeconds(error.data.retryAfter) : Number(stated);
-          if (seconds !== undefined) this.extendBackoff(seconds);
+          if (seconds !== undefined) this.pacer.extendBackoff(seconds);
           throw throttled(seconds, envelope, error);
         }
         // SE's own 503 and 500, wrapped in HTTP 400: transient, retried like a 5xx.
@@ -815,7 +742,7 @@ export class StackExchangeService {
       );
     }
 
-    if (wrapper.backoff && wrapper.backoff > 0) this.extendBackoff(wrapper.backoff);
+    if (wrapper.backoff && wrapper.backoff > 0) this.pacer.extendBackoff(wrapper.backoff, method);
 
     ctx.log.debug('SE quota', {
       quota_remaining: wrapper.quota_remaining,
@@ -906,152 +833,215 @@ export class StackExchangeService {
     ctx: Context,
   ): Promise<{
     thread: NormalizedThread;
+    answersHaveMore: boolean;
+    questionCommentsHaveMore: boolean;
+    answerCommentsHaveMore: boolean;
+    linkedLookupFailed?: 'answer' | 'comments';
     quotaRemaining: number;
     quotaMax: number;
     siteUsed: string;
   }> {
+    const answersPage = opts.answersPage ?? 1;
+    const commentsPage = opts.commentsPage ?? 1;
+    const requestedAnswerId = opts.answerId;
     // Outlives the attempt: once Stack Exchange has refused `site`, a retry goes
     // straight to the fallback instead of sending the refused site again.
     let site = opts.site;
     return withRetry(
       async (retry) => {
         const attempt = seAttempt(retry);
-        const fetchQuestion = (site: string) =>
+        const onResolvedSite = <T>(read: (site: string) => Promise<T>) =>
+          read(site).catch((error: unknown) => {
+            const fallback = opts.fallbackSite;
+            const unknownSite = error instanceof McpError && error.data?.reason === 'invalid_site';
+            if (fallback === undefined || site === fallback || !unknownSite) throw error;
+            site = fallback;
+            return read(site);
+          });
+        const fetchAnswer = (
+          answerId: number,
+          site: string,
+          mapping?: BadParameterMapping,
+          budget = attempt,
+        ) =>
+          this.fetchSe<SeAnswer>(
+            this.buildUrl(`/answers/${answerId}`, { site, filter: 'withbody' }),
+            ctx,
+            budget,
+            mapping,
+          );
+        let questionId = opts.questionId;
+        let linkedAnswer: SeAnswer | undefined;
+        if (opts.questionId === undefined) {
+          const answerId = opts.answerId;
+          const wrapper = await onResolvedSite((chosenSite) =>
+            fetchAnswer(answerId, chosenSite, answerIdOrParameter),
+          );
+          assertQuotaRemaining(wrapper);
+          linkedAnswer = wrapper.items.find((answer) => answer.answer_id === answerId);
+          if (!linkedAnswer) {
+            throw notFound(`Answer ID ${answerId} not found on site "${site}".`, {
+              reason: 'answer_not_found',
+              answerId,
+              site,
+            });
+          }
+          questionId = linkedAnswer.question_id;
+        }
+        const questionPath = `/questions/${questionId}`;
+        const questionWrapper = await onResolvedSite((chosenSite) =>
           this.fetchSe<SeQuestion>(
-            this.buildUrl(`/questions/${opts.questionId}`, { site, filter: 'withbody' }),
+            this.buildUrl(questionPath, { site: chosenSite, filter: SE_THREAD_FILTER }),
             ctx,
             attempt,
             questionIdOrParameter,
-          );
+          ),
+        );
 
-        const questionWrapper = await fetchQuestion(site).catch((error: unknown) => {
-          const fallback = opts.fallbackSite;
-          const unknownSite = error instanceof McpError && error.data?.reason === 'invalid_site';
-          if (fallback === undefined || site === fallback || !unknownSite) throw error;
-          site = fallback;
-          return fetchQuestion(fallback);
-        });
-
-        const answersUrl = this.buildUrl(`/questions/${opts.questionId}/answers`, {
-          site,
-          filter: 'withbody',
-          sort: 'votes',
-          pagesize: opts.maxAnswers ?? 10,
-        });
         // Before the next request: one sent against a spent quota draws a
         // throttle_violation, which would surface as `throttled` instead.
         assertQuotaRemaining(questionWrapper);
 
+        const q = questionWrapper.items[0];
+        if (!q) {
+          throw notFound(`Question ID ${questionId} not found on site "${site}".`, {
+            reason: 'question_not_found',
+            questionId,
+            site,
+          });
+        }
+
+        const answersUrl = this.buildUrl(`${questionPath}/answers`, {
+          site,
+          filter: 'withbody',
+          sort: 'votes',
+          pagesize: opts.maxAnswers ?? 10,
+          page: answersPage === 1 ? undefined : answersPage,
+        });
         const answersWrapper = await this.fetchSe<SeAnswer>(
           answersUrl,
           ctx,
           attempt,
           questionIdOrParameter,
         );
-
-        const q = questionWrapper.items[0];
-        if (!q) {
-          throw notFound(`Question ID ${opts.questionId} not found on site "${site}".`, {
-            reason: 'question_not_found',
-            questionId: opts.questionId,
-            site,
-          });
-        }
+        // Optional reads can fail. Keep quota from the last wrapper we received.
+        let quota: Pick<SeWrapper<unknown>, 'quota_remaining' | 'quota_max'> = answersWrapper;
 
         // The answers page is sorted by votes, so an accepted answer ranked below
         // the top-maxAnswers is never in it. Pull it explicitly and merge it in —
         // one extra call, only in the miss case — so the thread never reports an
         // acceptedAnswerId whose body is absent from answers[].
-        const answerItems = answersWrapper.items.slice();
+        const answerItems = new Map(
+          answersWrapper.items.map((answer) => [answer.answer_id, answer]),
+        );
+        if (linkedAnswer && !answerItems.has(linkedAnswer.answer_id)) {
+          answerItems.set(linkedAnswer.answer_id, linkedAnswer);
+        }
         if (
+          answersPage === 1 &&
           q.accepted_answer_id !== undefined &&
-          !answerItems.some((a) => a.answer_id === q.accepted_answer_id)
+          !answerItems.has(q.accepted_answer_id)
         ) {
-          const acceptedUrl = this.buildUrl(`/answers/${q.accepted_answer_id}`, {
-            site,
-            filter: 'withbody',
-          });
           // Default mapping, not questionIdOrParameter: `ids` on /answers/{id}
           // is the answer ID SE itself reported, never the caller's input.
-          const acceptedWrapper = await this.fetchSe<SeAnswer>(acceptedUrl, ctx, attempt);
+          const acceptedWrapper = await fetchAnswer(q.accepted_answer_id, site);
+          quota = acceptedWrapper;
           const acceptedAnswer = acceptedWrapper.items[0];
           if (acceptedAnswer) {
-            answerItems.push(acceptedAnswer);
+            answerItems.set(acceptedAnswer.answer_id, acceptedAnswer);
           }
         }
 
-        // Sort answers: accepted first, then by score descending
-        const answers = answerItems.sort((a, b) => {
-          const aAccepted = a.answer_id === q.accepted_answer_id ? 1 : 0;
-          const bAccepted = b.answer_id === q.accepted_answer_id ? 1 : 0;
-          if (aAccepted !== bAccepted) return bAccepted - aAccepted;
-          return b.score - a.score;
-        });
-
-        // Comments, when asked for: exactly two more calls, whatever the answer
-        // count — `/answers/{ids}/comments` batches every fetched answer into one
-        // semicolon-delimited request. Deferred until after the accepted-answer
-        // merge so a merged answer's comments ride the same batch, and skipped
-        // entirely on the not-found path above.
+        // Stable ID order keeps comment-page groups independent of display order.
         let questionComments: CommentState = {};
         const answerComments = new Map<number, CommentState>();
-
-        if (opts.includeComments) {
-          const commentParams = {
-            site,
-            filter: 'withbody',
-            // SE's own default order. Newest-first is what surfaces the
-            // corrections that make an old answer stale; sorting by votes would
-            // resurface the oldest high-vote comments instead.
-            sort: 'creation',
-            order: 'desc',
-            pagesize: COMMENTS_PAGE_SIZE,
-          };
-          const questionCommentsUrl = this.buildUrl(
-            `/questions/${opts.questionId}/comments`,
-            commentParams,
+        let questionCommentsHaveMore = false;
+        let answerCommentsHaveMore = false;
+        const commentParams = {
+          site,
+          filter: 'withbody',
+          sort: 'creation',
+          order: 'desc',
+          pagesize: COMMENTS_PAGE_SIZE,
+          page: commentsPage === 1 ? undefined : commentsPage,
+        };
+        const readAnswerComments = async (ids: number[], budget = attempt) => {
+          const wrapper = await this.fetchSe<SeComment>(
+            this.buildUrl(`/answers/${ids.join(';')}/comments`, commentParams),
+            ctx,
+            budget,
           );
-          // No answers means no `/answers/{ids}/comments` route to call at all.
-          const answerIds = answers.map((a) => a.answer_id);
-          const answerCommentsUrl =
-            answerIds.length > 0
-              ? this.buildUrl(`/answers/${answerIds.join(';')}/comments`, commentParams)
-              : undefined;
-
+          quota = wrapper;
+          answerCommentsHaveMore ||= wrapper.has_more;
+          const partial = commentsPage > 1 || wrapper.has_more;
+          const grouped = Map.groupBy(wrapper.items, (comment) => comment.post_id);
+          for (const id of ids) {
+            const own = grouped.get(id);
+            // Even a terminal later page cannot establish that a post has no comments.
+            if (own || !partial) answerComments.set(id, takeComments(own ?? [], partial));
+          }
+        };
+        if (opts.includeComments) {
           const questionCommentsWrapper = await this.fetchSe<SeComment>(
-            questionCommentsUrl,
+            this.buildUrl(`${questionPath}/comments`, commentParams),
             ctx,
             attempt,
             questionIdOrParameter,
           );
-          // Answer IDs came from SE; they are not the caller's question ID.
-          const answerCommentsWrapper = answerCommentsUrl
-            ? await this.fetchSe<SeComment>(answerCommentsUrl, ctx, attempt)
-            : undefined;
-
+          quota = questionCommentsWrapper;
+          questionCommentsHaveMore = questionCommentsWrapper.has_more;
           questionComments = takeComments(
             questionCommentsWrapper.items,
-            questionCommentsWrapper.has_more,
+            commentsPage > 1 || questionCommentsHaveMore,
           );
-
-          if (answerCommentsWrapper) {
-            // Keyed on post_id: the combined page is ordered across posts, so
-            // request order says nothing about which answer a comment belongs to.
-            const grouped = Map.groupBy(answerCommentsWrapper.items, (c) => c.post_id);
-            for (const answerId of answerIds) {
-              const own = grouped.get(answerId);
-              if (own) {
-                answerComments.set(answerId, takeComments(own, answerCommentsWrapper.has_more));
-                continue;
-              }
-              // Absent from the page. Only a page SE reported complete proves
-              // the post has none; with more pending, its state is unknown and
-              // stays absent rather than becoming an empty list.
-              answerComments.set(answerId, answerCommentsWrapper.has_more ? {} : { comments: [] });
-            }
+          const ids = [...answerItems.keys()].sort((a, b) => a - b);
+          for (let offset = 0; offset < ids.length; offset += MAX_IDS_PER_REQUEST) {
+            await readAnswerComments(ids.slice(offset, offset + MAX_IDS_PER_REQUEST));
           }
         }
 
+        let linkedLookupFailed: 'answer' | 'comments' | undefined;
+        if (requestedAnswerId !== undefined && !answerItems.has(requestedAnswerId)) {
+          // A long URL already identified a usable question. Complete its normal
+          // reads first so an optional lookup's backoff cannot block them.
+          const now = Date.now();
+          const deadlineAt = Math.min(attempt.deadlineAt, now + LINKED_LOOKUP_BUDGET_MS);
+          const deadline = new AbortController();
+          const expire = () =>
+            deadline.abort(new DOMException('Linked lookup timed out.', 'TimeoutError'));
+          const timer = deadlineAt > now ? setTimeout(expire, deadlineAt - now) : undefined;
+          if (timer === undefined) expire();
+          const budget = { deadlineAt, signal: AbortSignal.any([attempt.signal, deadline.signal]) };
+          try {
+            assertQuotaRemaining(quota);
+            const wrapper = await fetchAnswer(requestedAnswerId, site, undefined, budget);
+            quota = wrapper;
+            const linked = wrapper.items.find(
+              (answer) =>
+                answer.answer_id === requestedAnswerId && answer.question_id === questionId,
+            );
+            if (linked) {
+              answerItems.set(requestedAnswerId, linked);
+              if (opts.includeComments) {
+                assertQuotaRemaining(quota);
+                await readAnswerComments([requestedAnswerId], budget);
+              }
+            }
+          } catch (error) {
+            if (ctx.signal.aborted) throw error;
+            if (!(error instanceof McpError) && !budget.signal.aborted) throw error;
+            linkedLookupFailed = answerItems.has(requestedAnswerId) ? 'comments' : 'answer';
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+
+        // Accepted first, then by score descending, including merged answers.
+        const answers = [...answerItems.values()].sort((a, b) => {
+          const aAccepted = a.answer_id === q.accepted_answer_id ? 1 : 0;
+          const bAccepted = b.answer_id === q.accepted_answer_id ? 1 : 0;
+          return bAccepted - aAccepted || b.score - a.score;
+        });
         const normalizedAnswers: NormalizedAnswer[] = answers.map((a) => ({
           answerId: a.answer_id,
           score: a.score,
@@ -1070,7 +1060,19 @@ export class StackExchangeService {
             : {}),
         }));
 
+        const originals = q.closed_details?.original_questions;
         const thread: NormalizedThread = {
+          ...questionClosure(q),
+          ...(originals !== undefined && {
+            duplicateOf: originals.map((original) => ({
+              questionId: original.question_id,
+              title: decodeHtmlEntities(original.title),
+              answerCount: original.answer_count,
+              ...(original.accepted_answer_id !== undefined && {
+                acceptedAnswerId: original.accepted_answer_id,
+              }),
+            })),
+          }),
           questionId: q.question_id,
           title: decodeHtmlEntities(q.title),
           link: q.link,
@@ -1094,8 +1096,12 @@ export class StackExchangeService {
 
         return {
           thread,
-          quotaRemaining: questionWrapper.quota_remaining,
-          quotaMax: questionWrapper.quota_max,
+          answersHaveMore: answersWrapper.has_more,
+          questionCommentsHaveMore,
+          answerCommentsHaveMore,
+          ...(linkedLookupFailed ? { linkedLookupFailed } : {}),
+          quotaRemaining: quota.quota_remaining,
+          quotaMax: quota.quota_max,
           siteUsed: site,
         };
       },
@@ -1166,16 +1172,9 @@ export class StackExchangeService {
           site: opts.site,
           filter: SE_USER_FILTER,
         });
-        const topTagsUrl = this.buildUrl(`/users/${opts.userId}/top-tags`, {
-          site: opts.site,
-          pagesize: 10,
-        });
-
         const profileWrapper = await this.fetchSe<SeUser>(profileUrl, ctx, attempt);
         // Before the next request, as in getThread.
         assertQuotaRemaining(profileWrapper);
-        const topTagsWrapper = await this.fetchSe<SeTopTag>(topTagsUrl, ctx, attempt);
-
         const u = profileWrapper.items[0];
         if (!u) {
           throw notFound(`User ID ${opts.userId} not found on site "${opts.site}".`, {
@@ -1184,6 +1183,11 @@ export class StackExchangeService {
             site: opts.site,
           });
         }
+        const topTagsUrl = this.buildUrl(`/users/${opts.userId}/top-answer-tags`, {
+          site: opts.site,
+          pagesize: 10,
+        });
+        const topTagsWrapper = await this.fetchSe<SeTopTag>(topTagsUrl, ctx, attempt);
         const topTags = topTagsWrapper.items.map((t) => ({
           tagName: t.tag_name,
           ...(t.answer_count !== undefined ? { answerCount: t.answer_count } : {}),
@@ -1209,8 +1213,8 @@ export class StackExchangeService {
 
         return {
           user,
-          quotaRemaining: profileWrapper.quota_remaining,
-          quotaMax: profileWrapper.quota_max,
+          quotaRemaining: topTagsWrapper.quota_remaining,
+          quotaMax: topTagsWrapper.quota_max,
         };
       },
       {
@@ -1243,6 +1247,7 @@ export class StackExchangeService {
           apiSiteParameter: s.api_site_parameter,
           siteUrl: s.site_url,
           ...(s.audience ? { audience: decodeHtmlEntities(s.audience) } : {}),
+          ...(s.site_type !== undefined ? { siteType: s.site_type } : {}),
         });
 
         /**

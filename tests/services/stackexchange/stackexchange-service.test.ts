@@ -42,11 +42,168 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('StackExchangeService optional linked answer', () => {
+  const opts = { questionId: 1, answerId: 2, site: 'stackoverflow' };
+  const linkedAnswer = { answer_id: 2, question_id: 1, score: 1, is_accepted: false };
+  const wrap = (items: object[], quotaRemaining = 100) =>
+    jsonResponse({ items, has_more: false, quota_remaining: quotaRemaining, quota_max: 300 });
+  const mockThread = (
+    getAnswer: (signal?: AbortSignal | null) => Promise<Response>,
+    getComments: (signal?: AbortSignal | null) => Promise<Response> = async () => wrap([]),
+    votesQuota = 100,
+  ) =>
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const { pathname } = new URL(String(input));
+      if (pathname.endsWith('/answers/2')) return getAnswer(init?.signal);
+      if (pathname.endsWith('/answers/2/comments')) return getComments(init?.signal);
+      if (pathname.endsWith('/questions/1/answers')) return wrap([], votesQuota);
+      if (pathname.endsWith('/questions/1')) {
+        return wrap([
+          {
+            question_id: 1,
+            title: 'Question',
+            link: 'https://stackoverflow.com/q/1',
+            tags: [],
+            score: 1,
+            answer_count: 1,
+          },
+        ]);
+      }
+      return wrap([]);
+    });
+
+  it('includes a linked answer and comments when the optional requests succeed', async () => {
+    mockThread(
+      async () => wrap([linkedAnswer]),
+      async () => wrap([{ comment_id: 3, post_id: 2, body: 'Linked comment', score: 1 }]),
+    );
+    const result = await makeService().getThread(
+      { ...opts, includeComments: true },
+      createMockContext(),
+    );
+    expect(result.linkedLookupFailed).toBeUndefined();
+    expect(result.thread.answers).toMatchObject([{ answerId: 2, comments: [{ commentId: 3 }] }]);
+  });
+
+  it.each(['answer', 'comments'] as const)(
+    'releases the dispatch slot at the shared deadline when the linked %s body stalls',
+    async (stallAt) => {
+      vi.useFakeTimers();
+      const caller = new AbortController();
+      const bodyStarted = Promise.withResolvers<void>();
+      const aborted = vi.fn();
+      const stall = async (signal?: AbortSignal | null) => {
+        bodyStarted.resolve();
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              signal?.addEventListener(
+                'abort',
+                () => {
+                  aborted();
+                  controller.error(signal.reason);
+                },
+                { once: true },
+              );
+            },
+          }),
+        );
+      };
+      const fetchSpy = mockThread(
+        stallAt === 'answer'
+          ? stall
+          : async () => {
+              await new Promise<void>((resolve) => setTimeout(resolve, 1_500));
+              return wrap([linkedAnswer]);
+            },
+        stall,
+      );
+      const service = makeService();
+      const ctx = createMockContext({ signal: caller.signal });
+      const thread = service.getThread({ ...opts, includeComments: stallAt === 'comments' }, ctx);
+      let follower: ReturnType<typeof service.getThread> | undefined;
+      try {
+        if (stallAt === 'comments') await vi.advanceTimersByTimeAsync(1_500);
+        await bodyStarted.promise;
+        const calls = fetchSpy.mock.calls.length;
+        follower = service.getThread({ questionId: 1, site: opts.site }, ctx);
+        await vi.advanceTimersByTimeAsync(stallAt === 'answer' ? 1_999 : 499);
+        expect(fetchSpy).toHaveBeenCalledTimes(calls);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(aborted).toHaveBeenCalledOnce();
+        expect(fetchSpy.mock.calls.length).toBeGreaterThan(calls);
+        await expect(thread).resolves.toMatchObject({
+          linkedLookupFailed: stallAt,
+          thread: { questionId: 1, answers: stallAt === 'answer' ? [] : [{ answerId: 2 }] },
+        });
+        await expect(follower).resolves.toMatchObject({ thread: { questionId: 1 } });
+      } finally {
+        caller.abort();
+        await Promise.allSettled([thread, follower]);
+        service.dispose();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('propagates caller cancellation while reading the optional response body', async () => {
+    const caller = new AbortController();
+    const started = Promise.withResolvers<void>();
+    mockThread(async (signal) => {
+      started.resolve();
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            signal?.addEventListener('abort', () => controller.error(signal.reason), {
+              once: true,
+            });
+          },
+        }),
+      );
+    });
+    const service = makeService();
+    const pending = service.getThread(opts, createMockContext({ signal: caller.signal }));
+    try {
+      await started.promise;
+      caller.abort();
+      await expect(pending).rejects.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    } finally {
+      service.dispose();
+    }
+  });
+
+  it('skips the optional answer request when the required votes page spends the quota', async () => {
+    const fetchSpy = mockThread(async () => wrap([linkedAnswer]), undefined, 0);
+    const result = await makeService().getThread(opts, createMockContext());
+    expect(result).toMatchObject({
+      linkedLookupFailed: 'answer',
+      quotaRemaining: 0,
+      thread: { questionId: 1, answers: [] },
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the linked answer and skips its comments when the answer lookup spends the quota', async () => {
+    const fetchSpy = mockThread(async () => wrap([linkedAnswer], 0));
+    const result = await makeService().getThread(
+      { ...opts, includeComments: true },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({
+      linkedLookupFailed: 'comments',
+      quotaRemaining: 0,
+      thread: { questionId: 1, answers: [{ answerId: 2 }] },
+    });
+    expect(result.thread.answers[0]?.comments).toBeUndefined();
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+  });
+});
+
 describe('StackExchangeService entity decoding', () => {
   it('getUser decodes HTML entities in displayName and location', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       const url = String(input);
-      if (url.includes('/top-tags')) {
+      if (url.includes('/top-answer-tags')) {
         return jsonResponse({ items: [], has_more: false, quota_remaining: 100, quota_max: 300 });
       }
       return jsonResponse({
@@ -476,9 +633,6 @@ describe('StackExchangeService.getThread comment fetching', () => {
   const ACCEPTED_ID = 11227902;
   const OTHER_ID = 11227809111;
 
-  /** Mirrors MAX_COMMENTS_PER_POST in stackexchange-service.ts. */
-  const COMMENTS_CAP = 20;
-
   const commentItem = (
     postId: number,
     commentId: number,
@@ -786,12 +940,8 @@ describe('StackExchangeService.getThread comment fetching', () => {
     expect(byId.get(ACCEPTED_ID)?.commentsTruncated).toBe(true);
   });
 
-  // -- the per-post cap ------------------------------------------------------
-
-  it('caps one post at the per-post limit and marks that post truncated', async () => {
-    const over = Array.from({ length: COMMENTS_CAP + 5 }, (_, i) =>
-      commentItem(ACCEPTED_ID, i + 1),
-    );
+  it('returns every comment on the fetched page, including more than 20 on one post', async () => {
+    const comments = Array.from({ length: 25 }, (_, i) => commentItem(ACCEPTED_ID, i + 1));
     mockThread({
       answers: [
         {
@@ -809,7 +959,7 @@ describe('StackExchangeService.getThread comment fetching', () => {
           body: '<p>B.</p>',
         },
       ],
-      answerComments: [...over, commentItem(OTHER_ID, 999)],
+      answerComments: [...comments, commentItem(OTHER_ID, 999)],
       answerCommentsHasMore: false,
     });
 
@@ -819,10 +969,8 @@ describe('StackExchangeService.getThread comment fetching', () => {
     );
 
     const byId = new Map(thread.answers.map((a) => [a.answerId, a]));
-    // The cap bites on one post specifically...
-    expect(byId.get(ACCEPTED_ID)?.comments).toHaveLength(COMMENTS_CAP);
-    expect(byId.get(ACCEPTED_ID)?.commentsTruncated).toBe(true);
-    // ...and its neighbour in the same combined page stays whole.
+    expect(byId.get(ACCEPTED_ID)?.comments).toHaveLength(25);
+    expect(byId.get(ACCEPTED_ID)?.commentsTruncated).toBeUndefined();
     expect(byId.get(OTHER_ID)?.comments).toHaveLength(1);
     expect(byId.get(OTHER_ID)?.commentsTruncated).toBeUndefined();
   });
@@ -1202,7 +1350,7 @@ describe('StackExchangeService.getUser profile filter', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       const url = String(input);
       urls.push(url);
-      if (url.includes('/top-tags')) {
+      if (url.includes('/top-answer-tags')) {
         return jsonResponse({ items: [], has_more: false, quota_remaining: 100, quota_max: 300 });
       }
       return jsonResponse({
@@ -1222,15 +1370,15 @@ describe('StackExchangeService.getUser profile filter', () => {
     reputation: 1_400_000,
   };
 
-  it('requests the profile with the pinned custom filter and leaves top-tags unfiltered', async () => {
+  it('requests the profile with the pinned custom filter and leaves top-answer-tags unfiltered', async () => {
     const urls = mockUserFetch(baseUser);
 
     await makeService().getUser({ site: 'stackoverflow', userId: 22656 }, createMockContext());
 
     // Pre-fix the profile call carried no filter, so SE's default field set
     // omitted answer_count/question_count entirely.
-    const profileUrl = new URL(urls.find((u) => !u.includes('/top-tags')) ?? '');
-    const topTagsUrl = new URL(urls.find((u) => u.includes('/top-tags')) ?? '');
+    const profileUrl = new URL(urls.find((u) => !u.includes('/top-answer-tags')) ?? '');
+    const topTagsUrl = new URL(urls.find((u) => u.includes('/top-answer-tags')) ?? '');
     expect(profileUrl.searchParams.get('filter')).toBe(PINNED_USER_FILTER);
     expect(topTagsUrl.searchParams.get('filter')).toBeNull();
   });
@@ -1399,7 +1547,7 @@ describe('StackExchangeService date mapping', () => {
 
   it('getUser emits ISO 8601 account and last-access dates', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      if (String(input).includes('/top-tags')) {
+      if (String(input).includes('/top-answer-tags')) {
         return jsonResponse({ items: [], has_more: false, quota_remaining: 100, quota_max: 300 });
       }
       return jsonResponse({
@@ -1430,7 +1578,7 @@ describe('StackExchangeService date mapping', () => {
 
   it('getUser leaves both dates absent when the profile omits them', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      if (String(input).includes('/top-tags')) {
+      if (String(input).includes('/top-answer-tags')) {
         return jsonResponse({ items: [], has_more: false, quota_remaining: 100, quota_max: 300 });
       }
       return jsonResponse({
@@ -1635,7 +1783,7 @@ describe('StackExchangeService.searchQuestions custom filter', () => {
    * The filter string pinned in stackexchange-service.ts. Asserted as a literal
    * so swapping it without re-minting against /filters/create fails loudly.
    */
-  const PINNED_SEARCH_FILTER = '!-tSBS8YTedGMoaqycoVR';
+  const PINNED_SEARCH_FILTER = '!nHklukguOOJ2_O1n7UclKs';
 
   const emptySearch = { items: [], has_more: false, quota_remaining: 100, quota_max: 300 };
 

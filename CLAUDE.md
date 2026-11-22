@@ -2,8 +2,8 @@
 
 **Server:** stackexchange-mcp-server
 **Version:** 0.2.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` 2.4.0
 **Zod:** ^4.6.7
 
@@ -137,7 +137,7 @@ For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("
 
 `createApp({ sessionMode: 'stateless' })` declares this server's HTTP default; a meaningful `MCP_SESSION_MODE` overrides it. `auto` resolves to stateful; blank and unsubstituted placeholder values fall through to the source default. No tool requests client input. `ctx.state` remains tenant-scoped independently of HTTP sessions.
 
-The shared Stack Exchange pacer serializes upstream calls so each response's backoff applies before the next dispatch. Every operation has a 50-second deadline covering queue time, backoff, requests and retries. Each wait inside an attempt is checked against that deadline less a 1-second margin: a backoff that cannot fit fails at once as `throttled`, a queued call is refused the same way when such a backoff lands while it waits, and a queue wait that runs out sheds as `pacer_shed` before the deadline, all with `retryAfter` instead of running out the clock. `teardown()` disposes the pacer and rejects queued work.
+The shared Stack Exchange pacer dispatches one request at a time. A successful response’s `backoff` holds the same API method across sites and arguments, leaving other methods free to dispatch. HTTP 429 and `throttle_violation` hold every method. Each operation has a 50-second deadline covering queue time, backoff, requests and retries. A wait that cannot fit returns `throttled` or `pacer_shed` with `retryAfter`. Teardown rejects outstanding waits.
 
 ## Context
 
@@ -330,7 +330,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. MCPB is stdio-only — HTTP deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs at an installed package's root (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md`) and `SKILL.md` anywhere (nested `skills/` modules stay); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/` and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. MCPB is stdio-only — HTTP deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

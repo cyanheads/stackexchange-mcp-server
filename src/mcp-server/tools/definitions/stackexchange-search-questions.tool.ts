@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getStackExchangeService } from '@/services/stackexchange/stackexchange-service.js';
+import { appendClosureStats, closureFields } from '../question-closure.js';
 
 export const stackexchangeSearchQuestions = tool('stackexchange_search_questions', {
   title: 'Search Stack Exchange Questions',
@@ -25,17 +26,21 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
   input: z.object({
     query: z
       .string()
-      .describe('Full-text search query (e.g. "python async generator send value").'),
+      .describe(
+        'Full-text search query (e.g. "python async generator send value"). Pass an empty string to browse with the selected sort and filters.',
+      ),
     site: z
       .string()
       .default('stackoverflow')
       .describe(
-        'Stack Exchange site to search — the api_site_parameter (e.g. "stackoverflow", "superuser", "serverfault") or the site\'s domain (e.g. "serverfault.com"). Defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
+        'Stack Exchange site to search — the apiSiteParameter (e.g. "stackoverflow", "superuser", "serverfault") or the site\'s domain (e.g. "serverfault.com"). Blank or omitted defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
       ),
     tags: z
       .array(z.string().describe('A single tag to filter by (e.g. "python", "async").'))
       .optional()
-      .describe('Filter results to questions with all specified tags.'),
+      .describe(
+        'Filter results by tag. Surrounding whitespace is trimmed and blank entries are ignored.',
+      ),
     acceptedOnly: z
       .boolean()
       .optional()
@@ -77,6 +82,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       .array(
         z
           .object({
+            ...closureFields,
             questionId: z
               .number()
               .int()
@@ -117,7 +123,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
             'A Stack Exchange question with score, answer count, tags, dates, and optional excerpt.',
           ),
       )
-      .describe('Questions matching the search query, ordered by the specified sort.'),
+      .describe('Questions matching the supplied criteria, ordered by the applied sort.'),
     page: z
       .number()
       .int()
@@ -165,7 +171,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       code: JsonRpcErrorCode.ValidationError,
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
-        'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',
+        'Call stackexchange_list_sites to discover valid site apiSiteParameter values and retry.',
     },
     {
       reason: 'invalid_parameter',
@@ -188,17 +194,16 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       reason: 'throttled',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
-      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      when: 'Stack Exchange returned an IP throttle, or the backoff for this API method exceeds the remaining time.',
       recovery:
-        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+        'Wait the retryAfter seconds shown before retrying. A method backoff applies to that method across sites. HTTP 429 and throttle_violation apply to every method.',
     },
     {
       reason: 'pacer_shed',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
-      recovery:
-        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
+      recovery: 'Wait the retryAfter seconds shown before retrying the queued request.',
     },
     {
       reason: 'paging_depth_limit',
@@ -228,12 +233,14 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
 
   async handler(input, ctx) {
     const svc = getStackExchangeService();
-    const filteredTags = input.tags?.filter(Boolean);
+    const query = input.query.trim();
+    const site = input.site.trim() || 'stackoverflow';
+    const tags = input.tags?.map((tag) => tag.trim()).filter(Boolean);
     const { questions, quotaRemaining, quotaMax, hasMore, appliedSort } = await svc.searchQuestions(
       {
-        query: input.query,
-        site: input.site,
-        ...(filteredTags && filteredTags.length > 0 ? { tags: filteredTags } : {}),
+        query,
+        site,
+        ...(tags?.length ? { tags } : {}),
         ...(input.acceptedOnly !== undefined ? { acceptedOnly: input.acceptedOnly } : {}),
         ...(input.minScore !== undefined ? { minScore: input.minScore } : {}),
         sort: input.sort,
@@ -256,28 +263,30 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
         : {}),
     });
 
-    // The two notices are mutually exclusive — a filled page cannot be an empty
-    // one — and `truncated()` writes `notice` last-wins, so the branch is what
-    // keeps one from overwriting the other.
+    const browseNotice = !query && !tags?.length ? 'No query or tag filter was applied.' : '';
+    // Truncation and the browse notice share the same enrichment field.
     if (questions.length >= input.pageSize && hasMore) {
       ctx.enrich.truncated({
         shown: questions.length,
         cap: input.pageSize,
-        guidance:
-          `Showing page ${input.page}; Stack Exchange has more results. ` +
-          `Request page ${input.page + 1} with the same query and pageSize to continue — one API quota unit per page.`,
+        guidance: `${browseNotice ? `${browseNotice} ` : ''}Showing page ${input.page}; Stack Exchange has more results. Request page ${input.page + 1} with the same query and pageSize to continue — one API quota unit per page.`,
       });
     } else if (questions.length === 0) {
-      ctx.enrich.notice(
+      const scope = query ? ` for "${query}"` : tags?.length ? ' for the tagged questions' : '';
+      const emptyNotice =
         input.page > 1
-          ? `Page ${input.page} is past the end of the results for "${input.query}" on ${input.site}. Request a lower page.`
-          : `No questions matched "${input.query}" on ${input.site}. Try broader terms, different tags, or a different site.`,
-      );
+          ? `Page ${input.page} is past the end of the results${scope} on ${site}. Request a lower page.`
+          : query
+            ? `No questions matched "${query}" on ${site}. Try broader terms, different tags, or a different site.`
+            : `No questions found on ${site}. Try different tags or a different site.`;
+      ctx.enrich.notice(browseNotice ? `${browseNotice} ${emptyNotice}` : emptyNotice);
+    } else if (browseNotice) {
+      ctx.enrich.notice(browseNotice);
     }
 
     ctx.log.info('Searched SE questions', {
-      query: input.query,
-      site: input.site,
+      query,
+      site,
       page: input.page,
       count: questions.length,
     });
@@ -292,9 +301,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
 
   format: (result) => {
     if (result.questions.length === 0) {
-      return [
-        { type: 'text', text: `No questions found for the given query (page ${result.page}).` },
-      ];
+      return [{ type: 'text', text: `No questions found (page ${result.page}).` }];
     }
     const lines: string[] = [`**Page ${result.page}**\n`];
     for (const q of result.questions) {
@@ -307,6 +314,7 @@ export const stackexchangeSearchQuestions = tool('stackexchange_search_questions
       ];
       if (q.creationDate) stats.push(`**Asked:** ${q.creationDate}`);
       if (q.lastActivityDate) stats.push(`**Active:** ${q.lastActivityDate}`);
+      appendClosureStats(stats, q);
       lines.push(stats.join(' | '));
       lines.push(`**Tags:** ${escapeMarkdownInline(q.tags.join(', '))}`);
       lines.push(`**Link:** ${markdownLink(q.link, q.link)}`);

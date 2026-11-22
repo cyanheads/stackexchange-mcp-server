@@ -38,7 +38,7 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
       .string()
       .default('stackoverflow')
       .describe(
-        'Stack Exchange site the user ID belongs to — the api_site_parameter (e.g. "stackoverflow", "superuser") or the site\'s domain (e.g. "superuser.com"). User IDs are per-site, so pass the site of the thread the authorUserId came from. Defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
+        'Stack Exchange site the user ID belongs to — the apiSiteParameter (e.g. "stackoverflow", "superuser") or the site\'s domain (e.g. "superuser.com"). User IDs are per-site, so pass the site of the thread the authorUserId came from. Blank or omitted defaults to "stackoverflow". Call stackexchange_list_sites to discover valid values.',
       ),
   }),
   output: z.object({
@@ -86,7 +86,9 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
           })
           .describe('A tag the user has answered in, with answer count and score.'),
       )
-      .describe('Top tags by answer score (up to 10). Empty array for new users with no answers.'),
+      .describe(
+        'Top tags by answer score (up to 10). Empty when Stack Exchange returns no answer tags.',
+      ),
   }),
   enrichment: {
     quotaRemaining: z.number().describe('Remaining API quota calls for the current day.'),
@@ -121,7 +123,7 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'The provided site value is not a valid Stack Exchange network site identifier.',
       recovery:
-        'Call stackexchange_list_sites to discover valid site api_site_parameter values and retry.',
+        'Call stackexchange_list_sites to discover valid site apiSiteParameter values and retry.',
     },
     {
       reason: 'invalid_parameter',
@@ -144,17 +146,16 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
       reason: 'throttled',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
-      when: "Stack Exchange is throttling this server's IP address, or its backoff window outlasts what the call can wait.",
+      when: 'Stack Exchange returned an IP throttle, or the backoff for this API method exceeds the remaining time.',
       recovery:
-        "Stack Exchange is throttling this server's IP address; wait the retryAfter seconds the error states, then retry. A wait of hours means the IP's daily quota is spent; STACKEXCHANGE_API_KEY raises it to 10,000 requests per day.",
+        'Wait the retryAfter seconds shown before retrying. A method backoff applies to that method across sites. HTTP 429 and throttle_violation apply to every method.',
     },
     {
       reason: 'pacer_shed',
       thrownBy: 'service',
       code: JsonRpcErrorCode.RateLimited,
       when: "The call would wait in this server's queue to Stack Exchange longer than its time budget allows.",
-      recovery:
-        'Calls to Stack Exchange are queued behind a throttle or other calls; wait the retryAfter seconds the error states, then retry — parallel calls finish no sooner.',
+      recovery: 'Wait the retryAfter seconds shown before retrying the queued request.',
     },
     {
       reason: 'invalid_api_key',
@@ -185,9 +186,10 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
       );
     }
 
+    const site = input.site.trim() || 'stackoverflow';
     const svc = getStackExchangeService();
     const { user, quotaRemaining, quotaMax } = await svc.getUser(
-      { userId: input.userId, site: input.site },
+      { userId: input.userId, site },
       ctx,
     );
 
@@ -196,7 +198,7 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
     ctx.log.info('Fetched SE user', {
       userId: user.userId,
       displayName: user.displayName,
-      site: input.site,
+      site,
     });
 
     return user;
@@ -239,7 +241,7 @@ export const stackexchangeGetUser = tool('stackexchange_get_user', {
         lines.push(`- ${parts.join(' · ')}`);
       }
     } else {
-      lines.push('\n*No top tags — user has no answers yet.*');
+      lines.push('\n*No top tags by answer score.*');
     }
 
     return [{ type: 'text', text: lines.join('\n') }];

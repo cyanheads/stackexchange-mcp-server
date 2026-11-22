@@ -9,6 +9,7 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { stackexchangeListSites } from '@/mcp-server/tools/definitions/stackexchange-list-sites.tool.js';
+import { stackexchangeSearchQuestions } from '@/mcp-server/tools/definitions/stackexchange-search-questions.tool.js';
 import {
   getStackExchangeService,
   initStackExchangeService,
@@ -77,8 +78,7 @@ describe('upstream pacing', () => {
 
   it('disposal rejects queued work without dispatching it', async () => {
     vi.useFakeTimers();
-    // A backoff the active call can sleep out within its deadline, holding the
-    // slot so the next call queues behind it.
+    // Both calls wait on the method backoff until disposal or caller cancellation.
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => response(20));
     const service = makeService();
     await service.getSites(createMockContext());
@@ -236,6 +236,139 @@ const track = <T>(promise: Promise<T>) => {
 };
 
 describe('throttle classification and deadline-checked waits', () => {
+  it.each([
+    ['HTTP 429', () => tooManyRequests('120')],
+    ['throttle_violation', () => seEnvelope('throttle_violation', 502, THROTTLE_MESSAGE)],
+  ])('keeps %s global across separately queued methods', async (_label, answer) => {
+    vi.useFakeTimers();
+    const fetch = stubFetch().mockImplementationOnce(async () => answer());
+    const service = makeService();
+    const search = track(
+      service.searchQuestions({ query: 'q', site: 'stackoverflow' }, createMockContext()),
+    );
+    const sites = track(service.getSites(createMockContext()));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sites.outcome.error?.data?.reason).toBe('throttled');
+    await Promise.all([search.done, sites.done]);
+  });
+
+  it('lets another tool dispatch after a long method backoff and exposes the wait on both surfaces', async () => {
+    vi.useFakeTimers();
+    const fetch = stubFetch()
+      .mockImplementationOnce(async () => response(120))
+      .mockImplementationOnce(async () => response());
+    initStackExchangeService({} as AppConfig, {} as StorageService);
+    const search = await runToolContract(stackexchangeSearchQuestions, { query: 'first' });
+    expect(search.isError).not.toBe(true);
+    const blocked = await runToolContract(stackexchangeSearchQuestions, {
+      query: 'different',
+      site: 'superuser',
+      page: 2,
+    });
+    expect(blocked.isError).toBe(true);
+    expect(blocked.structuredContent).toMatchObject({
+      error: {
+        message: expect.stringContaining('/search/advanced'),
+        data: { reason: 'throttled', retryAfter: 120, recovery: { hint: expect.any(String) } },
+      },
+    });
+    expect(blocked.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('retry in 120 seconds') }),
+      ]),
+    );
+    const sites = await runToolContract(stackexchangeListSites, {});
+    expect(sites.isError).not.toBe(true);
+    expect(sites.structuredContent).toMatchObject({ sites: [] });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    getStackExchangeService().dispose();
+  });
+
+  it('takes already queued same-method requests out of the slot during a short backoff', async () => {
+    vi.useFakeTimers();
+    const first = Promise.withResolvers<Response>();
+    const fetch = stubFetch()
+      .mockReturnValueOnce(first.promise)
+      .mockImplementation(async () => response());
+    const service = makeService();
+    const search = track(
+      service.searchQuestions({ query: 'first', site: 'stackoverflow' }, createMockContext()),
+    );
+    const same = track(
+      service.searchQuestions({ query: 'next', site: 'superuser' }, createMockContext()),
+    );
+    const sites = track(service.getSites(createMockContext()));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    first.resolve(response(2));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sites.outcome.value?.sites).toEqual([]);
+    expect(same.outcome.settledAt).toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.all([search.done, same.done, sites.done]);
+    expect(same.outcome.value?.questions).toEqual([]);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('shares a tag method window across encoded names and pagination', async () => {
+    vi.useFakeTimers();
+    const fetch = stubFetch()
+      .mockImplementationOnce(async () => response(120))
+      .mockImplementationOnce(async () => response());
+    const service = makeService();
+    await service.getTagFaq({ tag: 'c#', site: 'stackoverflow' }, createMockContext());
+    await expect(
+      service.getTagFaq({ tag: 'c++', site: 'stackoverflow', page: 2 }, createMockContext()),
+    ).rejects.toMatchObject({ data: { reason: 'throttled', retryAfter: 120 } });
+    await expect(service.getSites(createMockContext())).resolves.toMatchObject({ sites: [] });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('shares the answer comments window across different batches without blocking earlier thread requests', async () => {
+    vi.useFakeTimers();
+    const reply = (items: object[]) =>
+      new Response(
+        JSON.stringify({ items, has_more: false, quota_remaining: 100, quota_max: 300 }),
+      );
+    const question = (id: number) =>
+      reply([{ question_id: id, title: 'Question', score: 0, tags: [], answer_count: 2 }]);
+    const answers = (ids: number[]) =>
+      reply(ids.map((answer_id) => ({ answer_id, score: 0, is_accepted: false })));
+    const fetch = stubFetch()
+      .mockImplementationOnce(async () => question(1))
+      .mockImplementationOnce(async () => answers([10, 11]))
+      .mockImplementationOnce(async () => response())
+      .mockImplementationOnce(async () => response(120))
+      .mockImplementationOnce(async () => question(2))
+      .mockImplementationOnce(async () => answers([20, 21]))
+      .mockImplementationOnce(async () => response());
+    const service = makeService();
+    const getThread = (questionId: number) =>
+      service.getThread(
+        { questionId, site: 'stackoverflow', includeComments: true },
+        createMockContext(),
+      );
+
+    await expect(getThread(1)).resolves.toMatchObject({ thread: { questionId: 1, comments: [] } });
+    await expect(getThread(2)).rejects.toMatchObject({
+      message: expect.stringContaining('/answers/{ids}/comments'),
+      data: { reason: 'throttled', retryAfter: 120 },
+    });
+    const paths = fetch.mock.calls.map(([input]) => new URL(String(input)).pathname);
+    expect(paths).toEqual([
+      '/2.3/questions/1',
+      '/2.3/questions/1/answers',
+      '/2.3/questions/1/comments',
+      '/2.3/answers/10;11/comments',
+      '/2.3/questions/2',
+      '/2.3/questions/2/answers',
+      '/2.3/questions/2/comments',
+    ]);
+  });
   it.each([
     [
       'a throttle_violation envelope',
@@ -477,7 +610,7 @@ describe('throttle classification and deadline-checked waits', () => {
     const service = makeService();
     await service.getSites(createMockContext());
     const startedAt = Date.now();
-    // Sleeps the 40s backoff in the slot, then hangs there.
+    // Both calls rejoin the queue after the 40s backoff. The first hangs in the slot.
     const holder = track(service.getSites(createMockContext()));
     const target = track(service.getSites(createMockContext()));
     await vi.advanceTimersByTimeAsync(DEADLINE_MS + 1);

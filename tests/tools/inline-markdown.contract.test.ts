@@ -20,6 +20,7 @@ import {
 
 const label = 'A*p* [x](https://evil.example)';
 const url = 'https://example.com/a(b)?x=1';
+const siteType = 'Future*Type* [x](https://evil.example/type)';
 const render = (markdown: string): string =>
   execFileSync('bun', ['-e', 'console.write(Bun.markdown.html(await Bun.stdin.text()))'], {
     input: markdown,
@@ -31,8 +32,16 @@ beforeEach(() => {
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     const path = new URL(String(input)).pathname;
     const items = path.endsWith('/sites')
-      ? [{ name: label, api_site_parameter: 'test', site_url: url, audience: label }]
-      : path.includes('/top-tags')
+      ? [
+          {
+            name: label,
+            api_site_parameter: 'test',
+            site_url: url,
+            audience: label,
+            site_type: siteType,
+          },
+        ]
+      : path.includes('/top-answer-tags')
         ? []
         : path.includes('/users/')
           ? [
@@ -110,6 +119,17 @@ describe('upstream plain text rendering', () => {
       }
     });
   }
+
+  it('preserves a future site type literally on both surfaces', async () => {
+    const result = await runToolContract(stackexchangeListSites, {});
+    const output = stackexchangeListSites.output.parse(result.structuredContent);
+    expect(output.sites[0]?.siteType).toBe(siteType);
+    const first = result.content[0];
+    expect(first?.type).toBe('text');
+    const html = render(first?.type === 'text' ? first.text : '');
+    expect(html).toContain(siteType);
+    expect(html).not.toContain('href="https://evil.example/type"');
+  });
 });
 
 describe('empty-result notices', () => {
